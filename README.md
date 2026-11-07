@@ -31,7 +31,8 @@ cargo add h3wire
 ```
 
 Or add `h3wire = "0.1"` under `[dependencies]`. For async HTTP/3 over quinn, add
-`h3wire-async` and `h3wire-quinn`.
+`h3wire-async` and `h3wire-quinn`; for MASQUE CONNECT-UDP (RFC 9298), add
+`h3wire-masque`.
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT license](LICENSE-MIT) at your option.

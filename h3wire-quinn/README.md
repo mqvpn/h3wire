@@ -9,6 +9,8 @@ quinn endpoint (ALPN `h3`) and hand its connections over.
 
 > **Note:** h3wire-async is a stable candidate; 1.0 waits for a downstream user outside this workspace.
 
+0.2.0: requires h3wire-async 0.2.
+
 ## Usage
 
 ```rust,ignore

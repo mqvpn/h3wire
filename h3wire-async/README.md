@@ -29,10 +29,6 @@ let resp = send.send_request(request).await?;
 
 See the [API documentation](https://docs.rs/h3wire-async).
 
-## License
-
-Licensed under either of Apache License, Version 2.0 or MIT license at your option.
-
 ## Changelog
 
 ### 0.2.0
@@ -51,3 +47,7 @@ Added:
 Changed:
 
 - Requests that were never sent when GOAWAY arrives are retryable.
+
+## License
+
+Licensed under either of Apache License, Version 2.0 or MIT license at your option.
