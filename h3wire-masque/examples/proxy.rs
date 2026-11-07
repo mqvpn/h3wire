@@ -29,7 +29,7 @@
 use bytes::Bytes;
 use h3wire_async::body::RecvBody;
 use h3wire_async::rt::TokioExecutor;
-use h3wire_async::{BoxError, Builder};
+use h3wire_async::{BoxError, Builder, DatagramError};
 use h3wire_masque::server::{self, Pending, Reject};
 use h3wire_masque::template::{Target, TargetHost, UriTemplate};
 use h3wire_masque::{MAX_UDP_PAYLOAD, UdpError, UdpTunnel};
@@ -240,8 +240,8 @@ async fn relay(pending: Pending, sock: UdpSocket) {
             },
             n = sock.recv(&mut buf) => match n {
                 Ok(n) => match tx.send(Bytes::copy_from_slice(&buf[..n])).await {
-                    // Over the datagram limit, or the send queue is full: a loss.
-                    Ok(()) | Err(UdpError::Datagram(_)) => {}
+                    // Over the datagram limit: a loss (a full send queue drops the oldest).
+                    Ok(()) | Err(UdpError::Datagram(DatagramError::TooLarge)) => {}
                     Err(e) => return eprintln!("tunnel: {e}"),
                 },
                 Err(e) => return eprintln!("target socket: {e}"),

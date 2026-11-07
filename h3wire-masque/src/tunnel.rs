@@ -46,7 +46,7 @@ pub enum Carrier {
 pub enum UdpError {
     /// The payload is over [`MAX_UDP_PAYLOAD`].
     TooLarge,
-    /// The sending side was finished.
+    /// The sending side was finished, or the request ended.
     Closed,
     /// The datagram carrier refused the payload (e.g. over the transport's limit).
     Datagram(DatagramError),
@@ -160,10 +160,10 @@ pub struct UdpSender {
 
 impl UdpSender {
     /// Send one UDP payload (empty is valid). Over [`MAX_UDP_PAYLOAD`] is `TooLarge`;
-    /// after [`finish`](Self::finish), `Closed`. The datagram carrier returns the
-    /// transport's refusal (e.g. `Datagram(TooLarge)`) and never falls back to a
-    /// capsule. The capsule carrier waits for stream credit; cancel-safe: a dropped
-    /// pending send wrote nothing.
+    /// after [`finish`](Self::finish), `Closed`. The datagram carrier returns `Closed`
+    /// once the request ended, otherwise the transport's refusal (e.g.
+    /// `Datagram(TooLarge)`), and never falls back to a capsule. The capsule carrier
+    /// waits for stream credit; cancel-safe: a dropped pending send wrote nothing.
     pub async fn send(&mut self, payload: Bytes) -> Result<(), UdpError> {
         if payload.len() > MAX_UDP_PAYLOAD {
             return Err(UdpError::TooLarge);
@@ -174,7 +174,10 @@ impl UdpSender {
         // Context ID 0, one byte.
         let value = Bytes::from([&[0][..], &payload].concat());
         if let Some(d) = &self.dgrams {
-            return d.send(value).map_err(UdpError::Datagram);
+            return d.send(value).map_err(|e| match e {
+                DatagramError::Closed => UdpError::Closed,
+                e => UdpError::Datagram(e),
+            });
         }
         // One `TunnelSend::send` call per capsule: it takes the `Bytes` whole or not at
         // all, so a cancelled send never leaves half a capsule on the stream.

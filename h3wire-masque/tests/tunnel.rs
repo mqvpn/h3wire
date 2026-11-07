@@ -523,3 +523,17 @@ async fn error_after_abort_is_sticky() {
     })
     .await
 }
+
+/// A datagram-carrier send after the request ended is `Closed`, not a datagram loss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn datagram_send_after_abort_is_closed() {
+    with_timeout(async {
+        let (mut p, mut reqs) = masque().await;
+        let (mut c, _s) = udp_pair(&mut p, &mut reqs).await;
+        assert_eq!(c.carrier(), Carrier::Datagram);
+        c.abort(MSG);
+        let r = c.send(Bytes::from_static(b"x")).await;
+        assert!(matches!(r, Err(UdpError::Closed)), "{r:?}");
+    })
+    .await
+}
