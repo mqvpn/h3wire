@@ -1,0 +1,108 @@
+masque-go cmd/client changes for interop/run.sh (docs/interop.md). Applied with
+`git apply` on the pinned tag in Dockerfile.peers. The library and cmd/proxy are
+unchanged; so is the client's protocol behaviour.
+
+1. `-ca FILE`: trust our test certificate for the proxy and for the target (the stock
+   client uses the system roots only).
+2. The response body goes to stdout as raw bytes, so the cell can hash it (the stock
+   client logs it with log.Println, which adds a timestamp and a newline).
+3. Before exit, close the tunnelled HTTP/3 connection with H3_NO_ERROR, wait 200 ms
+   for its CONNECTION_CLOSE datagram to leave, then close the CONNECT-UDP stream and
+   the proxy connection (the stock client exits without closing anything; run.sh
+   requires each connection to our server to close cleanly in time).
+
+diff --git a/cmd/client/main.go b/cmd/client/main.go
+index 3637ef5..5e01e6b 100644
+--- a/cmd/client/main.go
++++ b/cmd/client/main.go
+@@ -3,6 +3,7 @@ package main
+ import (
+ 	"context"
+ 	"crypto/tls"
++	"crypto/x509"
+ 	"flag"
+ 	"fmt"
+ 	"io"
+@@ -12,6 +13,7 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"strconv"
++	"time"
+ 
+ 	"github.com/quic-go/masque-go"
+ 
+@@ -21,8 +23,9 @@ import (
+ )
+ 
+ func main() {
+-	var proxyURITemplate string
++	var proxyURITemplate, caFile string
+ 	flag.StringVar(&proxyURITemplate, "t", "", "URI template")
++	flag.StringVar(&caFile, "ca", "", "CA certificate (PEM) trusted for the proxy and the target")
+ 	flag.Parse()
+ 	if proxyURITemplate == "" {
+ 		flag.Usage()
+@@ -33,7 +36,19 @@ func main() {
+ 		log.Fatal("usage: client -t <template> <url>")
+ 	}
+ 
++	var roots *x509.CertPool
++	if caFile != "" {
++		pem, err := os.ReadFile(caFile)
++		if err != nil {
++			log.Fatalf("reading CA failed: %v", err)
++		}
++		roots = x509.NewCertPool()
++		if !roots.AppendCertsFromPEM(pem) {
++			log.Fatal("no certificate in CA file")
++		}
++	}
+ 	tr := masque.Transport{
++		TLSClientConfig: &tls.Config{RootCAs: roots, NextProtos: []string{http3.NextProtoH3}},
+ 		QUICConfig: &quic.Config{
+ 			EnableDatagrams:   true,
+ 			InitialPacketSize: 1350,
+@@ -44,8 +59,11 @@ func main() {
+ 		log.Fatalf("failed to parse url: %v", err)
+ 	}
+ 
++	var pconn *masque.Conn
++	var qconn *quic.Conn
+ 	hcl := &http.Client{
+ 		Transport: &http3.Transport{
++			TLSClientConfig: &tls.Config{RootCAs: roots},
+ 			Dial: func(ctx context.Context, addr string, tlsConf *tls.Config, quicConf *quic.Config) (*quic.Conn, error) {
+ 				raddr, err := net.ResolveUDPAddr("udp", host+":"+strconv.Itoa(int(port)))
+ 				if err != nil {
+@@ -55,14 +73,15 @@ func main() {
+ 				if err != nil {
+ 					return nil, err
+ 				}
+-				pconn, _, err := tr.Dial(req)
++				pconn, _, err = tr.Dial(req)
+ 				if err != nil {
+ 					log.Fatal("dialing MASQUE failed:", err)
+ 				}
+ 				log.Printf("dialed connection: %s <-> %s", pconn.LocalAddr(), raddr)
+ 				quicConf = quicConf.Clone()
+ 				quicConf.DisablePathMTUDiscovery = true
+-				return quic.DialEarly(ctx, pconn, raddr, tlsConf, quicConf)
++				qconn, err = quic.DialEarly(ctx, pconn, raddr, tlsConf, quicConf)
++				return qconn, err
+ 			},
+ 		},
+ 	}
+@@ -75,7 +94,12 @@ func main() {
+ 	if err != nil {
+ 		log.Fatalf("reading response body failed: %v", err)
+ 	}
+-	log.Println(string(data))
++	os.Stdout.Write(data)
++	// Close the tunnelled HTTP/3 connection with H3_NO_ERROR, give its CONNECTION_CLOSE
++	// datagram time to leave, then close the CONNECT-UDP stream and the proxy connection.
++	qconn.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeNoError), "")
++	time.Sleep(200 * time.Millisecond)
++	pconn.Close()
+ }
+ 
+ func extractHostAndPort(template string) (string, uint16, error) {

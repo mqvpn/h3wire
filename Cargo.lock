@@ -402,6 +402,7 @@ dependencies = [
  "proptest",
  "quinn",
  "rcgen",
+ "rustix",
  "sha2",
  "tokio",
  "tower-service",

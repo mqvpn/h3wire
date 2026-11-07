@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
-# Our side of the interop matrix: the h3wire-quinn server and client examples, built
-# from the repository root (the build context) with the committed Cargo.lock.
+# Our side of the interop matrix: the h3wire-quinn server and client examples and the
+# h3wire-masque proxy and client examples, built from the repository root (the build
+# context) with the committed Cargo.lock.
 ARG DEBIAN_IMAGE=debian:trixie-slim
 ARG RUST_IMAGE=rust:1.98-slim-trixie
 
@@ -10,11 +11,16 @@ COPY Cargo.toml Cargo.lock ./
 COPY h3wire h3wire
 COPY h3wire-async h3wire-async
 COPY h3wire-quinn h3wire-quinn
+COPY h3wire-masque h3wire-masque
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p h3wire-quinn --example server --example client \
     && install -m 755 target/release/examples/server /usr/local/bin/h3wire-server \
-    && install -m 755 target/release/examples/client /usr/local/bin/h3wire-client
+    && install -m 755 target/release/examples/client /usr/local/bin/h3wire-client \
+    && cargo build --release --locked -p h3wire-masque --example proxy --example masque-client \
+    && install -m 755 target/release/examples/proxy /usr/local/bin/h3wire-masque-proxy \
+    && install -m 755 target/release/examples/masque-client /usr/local/bin/h3wire-masque-client
 
 FROM ${DEBIAN_IMAGE}
-COPY --from=build /usr/local/bin/h3wire-server /usr/local/bin/h3wire-client /usr/local/bin/
+COPY --from=build /usr/local/bin/h3wire-server /usr/local/bin/h3wire-client \
+    /usr/local/bin/h3wire-masque-proxy /usr/local/bin/h3wire-masque-client /usr/local/bin/
