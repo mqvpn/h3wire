@@ -8,8 +8,8 @@ use super::client::{client, drive, get, seen};
 use super::driver::{done, poll_once, spawn, take};
 use super::recv::{held_bytes, yield_now};
 use super::upgrade::{
-    Handed, Handoff, Pair, aborted_any, connect, out, plain, reply, request, reset_by, stopped_by,
-    until,
+    Handed, Handoff, Pair, aborted_any, connect, out, pair, plain, reply, request, reset_by,
+    stopped_by, until,
 };
 use crate::__testing::exec::{TestExec, run};
 use crate::__testing::{CorePeer, MockConn, MockNet, MockObs, PeerObs, Side};
@@ -663,4 +663,62 @@ fn split_clone_counts_users() {
         drop(tx2);
         assert_eq!(users(), before - 1);
     });
+}
+
+#[test]
+fn recv_queue_cap_is_per_request() {
+    let mut b = Builder::new();
+    b.datagram_recv_queue(2).unwrap();
+    let (net, _info, mut peer, mut reqs, exec) = server(&b, true);
+    run(&exec, async {
+        let (s0, (r0, _t0)) = open(&mut peer, &mut reqs, &CONNECT).await;
+        let (s4, (r4, _t4)) = open(&mut peer, &mut reqs, &CONNECT).await;
+        negotiated(&mut peer).await;
+        let mut d0 = slot(&r0).register().unwrap();
+        let mut d4 = slot(&r4).register().unwrap();
+        for m in ["0", "1", "2", "3", "4"] {
+            peer.send_datagram(s0, m.as_bytes()).unwrap();
+        }
+        peer.send_datagram(s4, b"a").unwrap();
+        settle(&mut peer).await;
+        for m in ["3", "4"] {
+            assert_eq!(next(&mut peer, &mut d0).await.unwrap(), m);
+        }
+        assert_eq!(next(&mut peer, &mut d4).await.unwrap(), "a");
+        assert!(!aborted_any(&net, s0) && !aborted_any(&net, s4));
+    });
+}
+
+#[test]
+fn send_queue_cap_is_per_connection() {
+    let mut b = Builder::new();
+    b.datagram_send_queue(3).unwrap();
+    let mut p = pair(&Builder::new(), &b);
+    let exec = p.exec.clone();
+    run(&exec, async {
+        let (sd, cd, _keep) = registered(&mut p).await;
+        // No await between the sends: the driver has not run.
+        for n in 1..=5 {
+            sd.send(Bytes::from(vec![7; n])).unwrap();
+        }
+        let mut cd = cd;
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            got.push(cd.recv().await.unwrap().unwrap().len());
+        }
+        assert_eq!(got, [3, 4, 5]);
+    });
+}
+
+#[test]
+fn zero_queue_rejected() {
+    let mut b = Builder::new();
+    assert!(matches!(
+        b.datagram_recv_queue(0),
+        Err(h3wire::UsageError::OutOfRange)
+    ));
+    assert!(matches!(
+        b.datagram_send_queue(0),
+        Err(h3wire::UsageError::OutOfRange)
+    ));
 }

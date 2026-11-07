@@ -116,7 +116,7 @@ impl Datagrams {
             let mut b = BytesMut::with_capacity(n + data.len());
             b.extend_from_slice(&p[..n]);
             b.extend_from_slice(&data);
-            let cap = i.dgram.queue_cap;
+            let cap = i.dgram.send_cap;
             push_bounded(&mut i.dgram.out, cap, b.freeze());
             i.wake_driver();
             Ok(())

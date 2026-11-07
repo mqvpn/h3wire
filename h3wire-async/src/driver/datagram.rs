@@ -54,8 +54,10 @@ pub(crate) struct Dgrams {
     pub pending_bytes: usize,
     /// Prefixed datagrams the handles queued for the transport (drop-oldest).
     pub out: VecDeque<Bytes>,
-    /// Capacity of a registered queue, and of `out`.
-    pub queue_cap: usize,
+    /// Capacity of a registered handle's queue.
+    pub recv_cap: usize,
+    /// Capacity of `out`.
+    pub send_cap: usize,
     /// Pending caps (count, bytes): per stream, per connection.
     pub stream_cap: (usize, usize),
     pub conn_cap: (usize, usize),
@@ -65,7 +67,8 @@ impl Dgrams {
     pub(crate) fn new(b: &Builder, on: bool) -> Self {
         Dgrams {
             on,
-            queue_cap: b.datagram_queue,
+            recv_cap: b.datagram_recv_queue,
+            send_cap: b.datagram_send_queue,
             stream_cap: b.pending_dgrams_stream,
             conn_cap: b.pending_dgrams_conn,
             ..Dgrams::default()
@@ -126,7 +129,7 @@ impl Inner {
     /// handle's queue. A stream already decided without registration stays so: its
     /// datagrams keep aborting it.
     pub(crate) fn register_datagrams(&mut self, id: StreamId) {
-        let cap = self.dgram.queue_cap;
+        let cap = self.dgram.recv_cap;
         let Some(d) = self.streams.get_mut(&id).map(|s| &mut s.dgram) else {
             return;
         };
@@ -164,7 +167,7 @@ impl Inner {
             return; // NotYetOpen, Drop
         };
         let b = own(&payload, range);
-        let cap = self.dgram.queue_cap;
+        let cap = self.dgram.recv_cap;
         let Some(d) = self.streams.get_mut(&id).map(|s| &mut s.dgram) else {
             return;
         };
