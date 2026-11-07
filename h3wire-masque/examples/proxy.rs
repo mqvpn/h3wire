@@ -168,7 +168,12 @@ async fn open(target: &Target) -> io::Result<UdpSocket> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address"))?,
     };
     // An IPv4-mapped address goes out over IPv4, where only the IPv4 DF option applies.
-    let addr = SocketAddr::new(addr.ip().to_canonical(), port);
+    let addr = match addr {
+        SocketAddr::V6(a) if a.ip().to_ipv4_mapped().is_some() => {
+            SocketAddr::new(addr.ip().to_canonical(), port)
+        }
+        a => a,
+    };
     let bind: SocketAddr = if addr.is_ipv6() {
         "[::]:0"
     } else {
