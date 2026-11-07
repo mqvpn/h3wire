@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 mp0rta
 //! HTTP datagrams in the driver (spec §3.4): send what the handles queued, drain the
-//! transport within the work budget, and route each datagram. Routing never waits on a
-//! handle: every queue is bounded and drops its oldest entry.
+//! transport within its own work budget (spec §3.3), and route each datagram. Routing
+//! never waits on a handle: every queue is bounded and drops its oldest entry.
 //!
 //! | `parse_datagram` | stream | action |
 //! |---|---|---|
