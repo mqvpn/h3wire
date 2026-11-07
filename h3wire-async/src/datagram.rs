@@ -26,6 +26,7 @@ use crate::state::{Inner, Shared};
 use bytes::{Bytes, BytesMut};
 use h3wire::{StreamId, UsageError};
 use std::future::poll_fn;
+use std::sync::Arc;
 use std::task::Poll;
 
 /// Client: register HTTP datagram semantics for this request (put it in the request's
@@ -125,6 +126,18 @@ impl Datagrams {
     /// The next datagram. `Ok(None)` once the request ended normally (no datagram can
     /// arrive after its receive side ended); an abort or the connection's close fails it.
     pub async fn recv(&mut self) -> Result<Option<Bytes>, Error> {
+        self.recv_shared().await
+    }
+
+    /// Split into a cloneable sender and a receiver. The registration stays until every
+    /// clone and the receiver are gone.
+    pub fn split(self) -> (DatagramSender, DatagramReceiver) {
+        let d = Arc::new(self);
+        (DatagramSender(d.clone()), DatagramReceiver(d))
+    }
+
+    /// `recv` for a shared handle: only one receiver ever calls it.
+    async fn recv_shared(&self) -> Result<Option<Bytes>, Error> {
         let id = self.id;
         poll_fn(|cx| {
             self.shared.with(|i| {
@@ -175,5 +188,32 @@ impl Drop for Datagrams {
             }
             i.release_user(id);
         });
+    }
+}
+
+/// The sending half of [`Datagrams::split`]; clones share it.
+#[derive(Clone, Debug)]
+pub struct DatagramSender(Arc<Datagrams>);
+
+impl DatagramSender {
+    /// As [`Datagrams::send`].
+    pub fn send(&self, data: Bytes) -> Result<(), DatagramError> {
+        self.0.send(data)
+    }
+
+    /// As [`Datagrams::max_payload`].
+    pub fn max_payload(&self) -> Option<usize> {
+        self.0.max_payload()
+    }
+}
+
+/// The receiving half of [`Datagrams::split`].
+#[derive(Debug)]
+pub struct DatagramReceiver(Arc<Datagrams>);
+
+impl DatagramReceiver {
+    /// As [`Datagrams::recv`].
+    pub async fn recv(&mut self) -> Result<Option<Bytes>, Error> {
+        self.0.recv_shared().await
     }
 }

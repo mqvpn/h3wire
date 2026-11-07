@@ -8,7 +8,8 @@ use super::client::{client, drive, get, seen};
 use super::driver::{done, poll_once, spawn, take};
 use super::recv::{held_bytes, yield_now};
 use super::upgrade::{
-    Handed, Handoff, aborted_any, connect, out, plain, reply, request, reset_by, stopped_by, until,
+    Handed, Handoff, Pair, aborted_any, connect, out, plain, reply, request, reset_by, stopped_by,
+    until,
 };
 use crate::__testing::exec::{TestExec, run};
 use crate::__testing::{CorePeer, MockConn, MockNet, MockObs, PeerObs, Side};
@@ -563,5 +564,79 @@ fn tiny_datagrams_do_not_pin_packet_buffers() {
             held <= 16 * 2 * 64,
             "{held} bytes kept alive by 16 datagrams"
         );
+    });
+}
+
+/// A registered CONNECT over a plain pair: server and client handles, plus the handles
+/// that keep the exchange alive.
+async fn registered(p: &mut Pair) -> (Datagrams, Datagrams, impl Sized + use<>) {
+    let mut r = connect();
+    r.extensions_mut().insert(RegisterDatagrams);
+    let (resp, (mut req, tx)) = request(p, r).await;
+    let sd = slot(&req).register().expect("server handle");
+    let on = upgrade::on(&mut req);
+    tx.send(reply(200, "")).unwrap();
+    let resp = out(&resp).await.expect("a response");
+    let cd = resp_slot(&resp).unwrap().register().expect("client handle");
+    until(|| cd.max_payload().is_some() && sd.max_payload().is_some()).await;
+    (sd, cd, (on, req, resp))
+}
+
+#[test]
+fn split_send_and_recv_independent() {
+    let mut p = plain();
+    let exec = p.exec.clone();
+    run(&exec, async {
+        let (sd, cd, _keep) = registered(&mut p).await;
+        let (_stx, mut srx) = sd.split();
+        let (ctx, _crx) = cd.split();
+        let sender = ctx.clone();
+        let (got, ()) = futures::join!(srx.recv(), async move {
+            yield_now().await;
+            sender.send(Bytes::from_static(b"hi")).unwrap();
+        });
+        assert_eq!(got.unwrap().unwrap(), "hi");
+        assert_eq!(ctx.max_payload(), _stx.max_payload());
+    });
+}
+
+#[test]
+fn split_registration_held_until_both_dropped() {
+    let (net, _info, mut peer, mut reqs, exec) = server(&Builder::new(), true);
+    run(&exec, async {
+        let (s, (mut req, tx)) = open(&mut peer, &mut reqs, &CONNECT).await;
+        let (stx, srx) = slot(&req).register().unwrap().split();
+        let _on = upgrade::on(&mut req);
+        tx.send(reply(200, "")).unwrap();
+        wait(&mut peer, |p| {
+            seen(p, s) && p.core().peer_settings().is_some()
+        })
+        .await;
+        until(|| stx.max_payload().is_some()).await;
+        drop(srx);
+        stx.send(Bytes::from_static(b"after")).unwrap();
+        wait(&mut peer, |p| peer_got(p, s, 5)).await;
+        drop(stx);
+        peer.send_datagram(s, b"late").unwrap();
+        wait(&mut peer, |_| true).await;
+        assert!(!aborted_any(&net, s), "{:?}", net.trace());
+    });
+}
+
+#[test]
+fn split_clone_counts_users() {
+    let mut p = plain();
+    let exec = p.exec.clone();
+    run(&exec, async {
+        let (_sd, cd, _keep) = registered(&mut p).await;
+        let users = || p.send.shared.with(|i| i.streams[&StreamId(0)].users);
+        let before = users();
+        let (tx, rx) = cd.split();
+        let tx2 = tx.clone();
+        assert_eq!(users(), before);
+        drop((rx, tx));
+        assert_eq!(users(), before, "a clone is left");
+        drop(tx2);
+        assert_eq!(users(), before - 1);
     });
 }
