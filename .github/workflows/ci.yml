@@ -70,9 +70,9 @@ jobs:
           ! grep -q tokio tree.txt
       # h3wire-masque stays runtime- and QUIC-stack-free.
       - run: |
-          cargo tree -p h3wire-masque -e normal --prefix none > tree.txt
+          cargo tree -p h3wire-masque -e normal,features --prefix none > tree.txt
           grep -q '^h3wire-masque' tree.txt
-          if grep -q -e tokio -e quinn tree.txt; then exit 1; fi
+          if grep -q -e tokio -e quinn -e __testing tree.txt; then exit 1; fi
 
   msrv:
     if: github.event_name != 'schedule'

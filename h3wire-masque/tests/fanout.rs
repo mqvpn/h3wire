@@ -66,7 +66,8 @@ async fn many_tunnels_with_udp_echo() {
                     c.send(msg.into()).await.unwrap();
                     // Wait for an echo, or 50 ms, then retransmit.
                     if let Ok(r) = tokio::time::timeout(Duration::from_millis(50), c.recv()).await {
-                        let d = r.unwrap().unwrap();
+                        let d = r.expect("recv failed").expect("tunnel ended early");
+                        assert!(d.len() >= 2, "tunnel {i}: short echo");
                         let got = u16::from_be_bytes([d[0], d[1]]);
                         assert_eq!(got, i, "tunnel {i} got an echo of tunnel {got}");
                         echoed = true;
@@ -74,7 +75,8 @@ async fn many_tunnels_with_udp_echo() {
                 }
                 c.finish().unwrap();
                 // Late echoes of retransmissions may precede the end of the stream.
-                while let Some(d) = c.recv().await.unwrap() {
+                while let Some(d) = c.recv().await.expect("recv failed") {
+                    assert!(d.len() >= 2, "tunnel {i}: short echo");
                     assert_eq!(u16::from_be_bytes([d[0], d[1]]), i);
                 }
             });
