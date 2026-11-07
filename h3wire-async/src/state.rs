@@ -284,8 +284,10 @@ pub(crate) struct Inner {
     pub driver_waker: Option<Waker>,
     /// Woken by `Shared::with` after the lock is released.
     pub pending_wakers: Vec<Waker>,
-    /// Connection-level waiters (`ConnInfo::settings`): woken on SETTINGS and on close.
-    pub conn_wakers: Vec<Waker>,
+    /// Connection-level waiters (`ConnInfo::settings`) by id: woken on SETTINGS and on
+    /// close, removed when a wait is dropped.
+    pub conn_wakers: Vec<(u64, Waker)>,
+    pub next_conn_wait: u64,
     pub close: Option<CloseCause>,
     /// Raw request-stream bytes read but not fed to the core yet, with FIN (§3.2).
     pub retained: HashMap<StreamId, (Bytes, bool)>,
@@ -327,15 +329,28 @@ impl Inner {
         self.pending_wakers.extend(self.driver_waker.take());
     }
 
-    /// Register a connection-level waiter (deduplicated).
-    pub(crate) fn wait_conn(&mut self, w: &Waker) {
-        if !self.conn_wakers.iter().any(|x| x.will_wake(w)) {
-            self.conn_wakers.push(w.clone());
+    /// Register (or refresh) the connection-level waiter `id`, allocating it if `None`.
+    pub(crate) fn wait_conn(&mut self, id: &mut Option<u64>, w: &Waker) {
+        let found = id.and_then(|k| self.conn_wakers.iter_mut().find(|(x, _)| *x == k));
+        match found {
+            Some((_, old)) => old.clone_from(w),
+            None => {
+                let k = *id.get_or_insert_with(|| {
+                    self.next_conn_wait += 1;
+                    self.next_conn_wait
+                });
+                self.conn_wakers.push((k, w.clone()));
+            }
         }
     }
 
+    pub(crate) fn unwait_conn(&mut self, id: u64) {
+        self.conn_wakers.retain(|(k, _)| *k != id);
+    }
+
     pub(crate) fn wake_conn(&mut self) {
-        self.pending_wakers.append(&mut self.conn_wakers);
+        let w = self.conn_wakers.drain(..).map(|(_, w)| w);
+        self.pending_wakers.extend(w);
     }
 
     /// The connection is over: record the first cause and wake every handle.
@@ -657,6 +672,7 @@ impl Shared {
             driver_waker: None,
             pending_wakers: Vec::new(),
             conn_wakers: Vec::new(),
+            next_conn_wait: 0,
             close: None,
             retained: HashMap::new(),
             speculative: 0,

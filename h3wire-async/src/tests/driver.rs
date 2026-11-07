@@ -192,6 +192,26 @@ fn driver_drop_closes_no_error() {
     assert_eq!(net.closed_with(Side::Client), Some(0x100));
 }
 
+/// A dropped `settings` wait leaves no waker behind (a peer that never sends SETTINGS
+/// must not make cancelled waits pile up).
+#[test]
+fn settings_wait_unregisters_on_drop() {
+    let (_net, driver, mut peer) = setup(Role::Server, &Builder::new(), Config::default());
+    peer.defer_control(true);
+    let shared = driver.shared();
+    let info = ConnInfo::new(shared.clone());
+    let exec = TestExec::default();
+    run(&exec, async {
+        for _ in 0..2 {
+            let mut w = pin!(info.settings());
+            assert!(poll_once(&mut w).await.is_pending());
+            assert!(poll_once(&mut w).await.is_pending());
+        }
+    });
+    assert_eq!(shared.with(|i| i.conn_wakers.len()), 0);
+    drop(driver);
+}
+
 fn kind(r: Result<(), Error>) -> ErrorKind {
     r.expect_err("driver must fail").kind().clone()
 }

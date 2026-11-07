@@ -51,6 +51,8 @@ Changed:
 - `work_budget(n)` is counted separately for stream work, datagram send and datagram
   receive, so none starves another; one driver poll may do up to 3 × `n` transport
   operations.
+- A dropped `ConnInfo::settings` or `SendRequest::settings` wait unregisters its waker
+  (it was kept until SETTINGS or close).
 
 ## License
 
