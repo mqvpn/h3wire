@@ -40,13 +40,17 @@ Breaking:
 
 Added:
 
-- `OnUpgrade::abort` aborts a CONNECT before the response arrives.
+- `OnUpgrade::abort` aborts a CONNECT before its response: on the server, before the
+  response is sent; on the client, before the tunnel is taken.
 - `Datagrams::split` yields a `Clone` `DatagramSender` and a `DatagramReceiver`.
-- Datagram receive has its own slice of the per-poll work budget.
+- `DatagramError` implements `Display` and `std::error::Error`.
 
 Changed:
 
 - Requests that were never sent when GOAWAY arrives are retryable.
+- `work_budget(n)` is counted separately for stream work, datagram send and datagram
+  receive, so none starves another; one driver poll may do up to 3 × `n` transport
+  operations.
 
 ## License
 
