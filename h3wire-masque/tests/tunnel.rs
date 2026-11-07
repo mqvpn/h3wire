@@ -349,13 +349,14 @@ async fn recv_alternates_under_datagram_flood() {
         }
         assert_eq!(caps, 10, "capsules starved ({dgrams} datagrams)");
         assert!(dgrams > 0, "no flood seen");
-        // EOF still ends `recv`.
-        stop.store(true, Ordering::Relaxed);
-        flood.await.unwrap();
+        // EOF still ends `recv`, the flood running until the FIN (sends after it are
+        // refused).
         ct.finish().unwrap();
         while let Some(b) = s.recv().await.unwrap() {
             assert_eq!(b, "flood");
         }
+        stop.store(true, Ordering::Relaxed);
+        flood.await.unwrap();
     })
     .await
 }
