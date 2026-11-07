@@ -110,14 +110,19 @@ impl UriTemplate {
             _ => return Err(TemplateError::Syntax),
         };
         let (authority, rest) = rest.split_once('/').ok_or(TemplateError::Syntax)?;
+        if authority.contains(['{', '}']) {
+            return Err(TemplateError::Variables);
+        }
+        Authority::from_str(authority).map_err(|_| TemplateError::Syntax)?;
         let (path, query) = match rest.split_once('?') {
             Some((p, q)) => (p, Some(q.to_owned())),
             None => (rest, None),
         };
-        if authority.contains(['{', '}'])
-            || query.as_deref().is_some_and(|q| q.contains(['{', '}']))
-        {
+        if query.as_deref().is_some_and(|q| q.contains(['{', '}'])) {
             return Err(TemplateError::Variables);
+        }
+        if query.as_deref().is_some_and(|q| !literal(q)) {
+            return Err(TemplateError::Syntax);
         }
         let (mut hosts, mut ports) = (0, 0);
         let mut segs = Vec::new();
@@ -145,6 +150,7 @@ impl UriTemplate {
                         TemplateError::Syntax
                     });
                 }
+                _ if !literal(seg) => return Err(TemplateError::Syntax),
                 _ => Seg::Lit(seg.to_owned()),
             });
         }
@@ -231,6 +237,19 @@ impl UriTemplate {
         );
         Ok(Target::new(parse_host(host)?, parse_port(port)?))
     }
+}
+
+/// RFC 6570 section 2.1 literals (in printable ASCII, already checked): no double or
+/// single quote, angle bracket, backslash, caret, backtick, bar or brace, and `%` only
+/// as a two-hex-digit escape.
+fn literal(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.iter().enumerate().all(|(i, &c)| match c {
+        b'%' => b
+            .get(i + 1..i + 3)
+            .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit)),
+        _ => !b"\"'<>\\^`{|}".contains(&c),
+    })
 }
 
 fn parse_host(s: &str) -> Result<TargetHost, TemplateError> {
@@ -376,6 +395,24 @@ mod tests {
         );
         assert_eq!(p("https://proxy/a b/{target_host}/{target_port}/"), Syntax);
         assert!(UriTemplate::parse("https://proxy/%C3%A9/{target_host}/{target_port}/").is_ok());
+        // The authority ends at the first `/`: a query before it is not an authority.
+        assert_eq!(p("https://proxy?x=/{target_host}/{target_port}/"), Syntax);
+        // RFC 6570 section 2.1 literals, in the path and the query.
+        for bad in [
+            "%zz", "%4", "a|b", "a^b", "a\\b", "a<b", "a\"b", "a'b", "a`b",
+        ] {
+            assert_eq!(
+                p(&format!("https://p/{bad}/{{target_host}}/{{target_port}}/")),
+                Syntax
+            );
+            assert_eq!(
+                p(&format!(
+                    "https://p/{{target_host}}/{{target_port}}/?q={bad}"
+                )),
+                Syntax
+            );
+        }
+        assert!(UriTemplate::parse("https://p/{target_host}/{target_port}/?q=%C3%A9").is_ok());
     }
 
     #[test]
