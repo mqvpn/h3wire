@@ -72,15 +72,16 @@ impl Error {
         }
     }
 
-    /// Whether the request is safe to retry on another connection (a GOAWAY cutoff or a
-    /// peer `H3_REQUEST_REJECTED`).
+    /// Whether the request is safe to retry on another connection: it was never sent
+    /// ([`UsageError::GoingAway`]), fell past the GOAWAY cutoff, or the peer sent
+    /// `H3_REQUEST_REJECTED`.
     pub fn is_retryable(&self) -> bool {
         matches!(
             self.kind,
             ErrorKind::StreamAborted {
                 retryable: true,
                 ..
-            }
+            } | ErrorKind::Usage(UsageError::GoingAway)
         )
     }
 }
@@ -141,3 +142,16 @@ pub enum DatagramError {
     /// The request or connection has ended.
     Closed,
 }
+
+impl fmt::Display for DatagramError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotNegotiated => "peer SETTINGS have not confirmed H3_DATAGRAM yet",
+            Self::Unsupported => "peer does not support datagrams",
+            Self::TooLarge => "datagram exceeds the current limit",
+            Self::Closed => "request or connection has ended",
+        })
+    }
+}
+
+impl std::error::Error for DatagramError {}

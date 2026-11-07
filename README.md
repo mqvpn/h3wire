@@ -18,8 +18,9 @@ and QPACK streams, GOAWAY and stream termination, QPACK with the static table on
 | `h3wire` | Sans-I/O HTTP/3 and QPACK core (no I/O, no runtime, no dependencies) |
 | `h3wire-async` | Runtime-neutral async layer: client, server, bodies, Extended CONNECT, datagrams. The `tokio` feature adds `TokioExecutor` |
 | `h3wire-quinn` | quinn 0.11 transport for `h3wire-async` |
+| `h3wire-masque` | MASQUE CONNECT-UDP (RFC 9298) and the HTTP capsule codec (RFC 9297) over `h3wire-async` |
 
-> **Note:** h3wire-async's API is unstable until the v0.3 MASQUE milestone: expect 0.x minor bumps; patches never break.
+> **Note:** h3wire-async is a stable candidate; 1.0 waits for a downstream user outside this workspace.
 
 ## Installation
 
@@ -30,7 +31,8 @@ cargo add h3wire
 ```
 
 Or add `h3wire = "0.1"` under `[dependencies]`. For async HTTP/3 over quinn, add
-`h3wire-async` and `h3wire-quinn`.
+`h3wire-async` and `h3wire-quinn`; for MASQUE CONNECT-UDP (RFC 9298), add
+`h3wire-masque`.
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT license](LICENSE-MIT) at your option.

@@ -3,7 +3,10 @@
 //! Runtime-neutral async HTTP/3 over the sans-I/O [`h3wire`] core.
 //!
 //! The QUIC transport is abstracted behind the poll-based traits in [`quic`]; the
-//! application supplies an [`rt::Executor`]. The API is unstable (0.x).
+//! application supplies an [`rt::Executor`].
+//!
+//! h3wire-async is a stable candidate; 1.0 waits for a downstream user outside this
+//! workspace.
 //!
 //! The `__testing` feature exposes test support for this workspace's own crates; it is
 //! unstable, internal-only and not covered by any compatibility promise.

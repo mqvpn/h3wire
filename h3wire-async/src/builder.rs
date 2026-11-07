@@ -13,7 +13,8 @@ pub struct Builder {
     pub(crate) demand_chunk: usize,
     pub(crate) send_capacity: usize,
     pub(crate) work_budget: usize,
-    pub(crate) datagram_queue: usize,
+    pub(crate) datagram_recv_queue: usize,
+    pub(crate) datagram_send_queue: usize,
     pub(crate) pending_dgrams_stream: (usize, usize),
     pub(crate) pending_dgrams_conn: (usize, usize),
 }
@@ -27,7 +28,8 @@ impl Default for Builder {
             demand_chunk: 16 * 1024,
             send_capacity: 64 * 1024,
             work_budget: 64,
-            datagram_queue: 64,
+            datagram_recv_queue: 64,
+            datagram_send_queue: 64,
             pending_dgrams_stream: (16, 16 * 1024),
             pending_dgrams_conn: (256, 256 * 1024),
         }
@@ -106,17 +108,33 @@ impl Builder {
         self
     }
 
-    /// Operations per driver pass before it yields. Default 64; 0 counts as 1.
+    /// Transport operations per driver pass before it yields, counted separately for
+    /// stream work, datagram send and datagram receive: each gets `n`, so one poll may
+    /// do up to 3 × `n`. Default 64; 0 counts as 1.
     pub fn work_budget(&mut self, n: usize) -> &mut Self {
         self.work_budget = n;
         self
     }
 
-    /// Capacity of a registered datagram queue, and of the connection's queue of datagrams
-    /// waiting for the driver to send them (both drop-oldest). Default 64.
-    pub fn datagram_queue(&mut self, n: usize) -> &mut Self {
-        self.datagram_queue = n;
-        self
+    /// Capacity of each request's incoming datagram queue (drop-oldest: when full, the
+    /// oldest datagram is evicted). Per request. Default 64; 0 is rejected.
+    pub fn datagram_recv_queue(&mut self, n: usize) -> Result<&mut Self, UsageError> {
+        if n == 0 {
+            return Err(UsageError::OutOfRange);
+        }
+        self.datagram_recv_queue = n;
+        Ok(self)
+    }
+
+    /// Capacity of the connection's queue of datagrams waiting for the driver to send
+    /// them (drop-oldest). Shared by every request of the connection. Default 64; 0 is
+    /// rejected.
+    pub fn datagram_send_queue(&mut self, n: usize) -> Result<&mut Self, UsageError> {
+        if n == 0 {
+            return Err(UsageError::OutOfRange);
+        }
+        self.datagram_send_queue = n;
+        Ok(self)
     }
 
     /// Pending (not yet registered) datagrams kept per stream: count and bytes. Default

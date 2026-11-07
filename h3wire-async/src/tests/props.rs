@@ -188,7 +188,10 @@ impl Limits {
             .send_capacity(self.send)
             .max_encoded_field_section_size(self.field)
             .work_budget(self.budget)
-            .datagram_queue(self.dq)
+            .datagram_recv_queue(self.dq)
+            .unwrap()
+            .datagram_send_queue(self.dq)
+            .unwrap()
             .pending_datagrams_per_stream(self.stream_cap.0, self.stream_cap.1)
             .pending_datagrams_per_conn(self.conn_cap.0, self.conn_cap.1);
         b

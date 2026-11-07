@@ -131,15 +131,26 @@ impl ConnInfo {
 
     /// Wait for the peer's SETTINGS; `None` if the connection closes first.
     pub async fn settings(&self) -> Option<PeerSettings> {
+        /// Unregisters on drop, so a cancelled wait leaves no waker behind.
+        struct Wait<'a>(&'a Shared, Option<u64>);
+        impl Drop for Wait<'_> {
+            fn drop(&mut self) {
+                if let Some(id) = self.1 {
+                    self.0.with(|i| i.unwait_conn(id));
+                }
+            }
+        }
+        let mut w = Wait(&self.shared, None);
         poll_fn(|cx| {
-            self.shared.with(|i| {
+            let Wait(shared, id) = &mut w;
+            shared.with(|i| {
                 if let Some(s) = i.conn.peer_settings() {
                     return Poll::Ready(Some(s.clone()));
                 }
                 if i.close.is_some() {
                     return Poll::Ready(None);
                 }
-                i.wait_conn(cx.waker());
+                i.wait_conn(id, cx.waker());
                 Poll::Pending
             })
         })

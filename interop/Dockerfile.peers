@@ -1,9 +1,11 @@
 # syntax=docker/dockerfile:1.7
 # Interop peers at the versions pinned in versions.env (run.sh passes them as build args):
 # curl (ngtcp2/nghttp3), the ngtcp2 example client and server, quiche-client and
-# quiche-server, and h3spec. The build context is unused.
+# quiche-server, masque-go's client (patched, interop/masque-go.patch) and proxy, socat
+# (the MASQUE cells' UDP echo), and h3spec. The build context is interop/.
 ARG DEBIAN_IMAGE=debian:trixie-slim
 ARG RUST_IMAGE=rust:1.98-slim-trixie
+ARG GO_IMAGE=golang:1.26-trixie
 
 FROM ${DEBIAN_IMAGE} AS c-build
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -48,13 +50,24 @@ RUN git clone -q --depth 1 --branch "$QUICHE_TAG" --recurse-submodules --shallow
         /usr/local/bin/ \
     && rm -rf quiche "$CARGO_HOME/registry" "$CARGO_HOME/git"
 
+FROM ${GO_IMAGE} AS go-build
+WORKDIR /build
+COPY masque-go.patch .
+ARG MASQUE_GO_TAG MASQUE_GO_COMMIT
+RUN git clone -q --depth 1 --branch "$MASQUE_GO_TAG" https://github.com/quic-go/masque-go \
+    && test "$(git -C masque-go rev-parse HEAD)" = "$MASQUE_GO_COMMIT" \
+    && git -C masque-go apply ../masque-go.patch \
+    && cd masque-go && CGO_ENABLED=0 go build -trimpath -o /usr/local/bin/masque-go-client ./cmd/client \
+    && CGO_ENABLED=0 go build -trimpath -o /usr/local/bin/masque-go-proxy ./cmd/proxy
+
 FROM ${DEBIAN_IMAGE}
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates openssl libev4t64 zlib1g libgmp10 \
+        ca-certificates openssl libev4t64 zlib1g libgmp10 socat \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=c-build /usr/local/lib/ /usr/local/lib/
 COPY --from=c-build /usr/local/bin/ /usr/local/bin/
 COPY --from=quiche-build /usr/local/bin/quiche-client /usr/local/bin/quiche-server /usr/local/bin/
+COPY --from=go-build /usr/local/bin/masque-go-client /usr/local/bin/masque-go-proxy /usr/local/bin/
 ARG H3SPEC_URL H3SPEC_SHA256
 ADD --checksum=sha256:${H3SPEC_SHA256} --chmod=755 ${H3SPEC_URL} /usr/local/bin/h3spec
 RUN ldconfig && curl --version | head -1 && h3spec -v

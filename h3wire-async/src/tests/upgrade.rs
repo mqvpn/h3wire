@@ -17,11 +17,14 @@ use crate::upgrade::{self, Tunnel};
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
+use futures::task::ArcWake;
 use h3wire::{AbortSource, Config, H3Code, Role, StreamId, UsageError};
 use http::{Method, Request, Response};
 use http_body::Body;
 use std::future::{Future, poll_fn};
 use std::pin::{Pin, pin};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tower_service::Service;
 
@@ -180,6 +183,7 @@ fn is_aborted(e: &Error, code: H3Code, source: AbortSource) -> bool {
 }
 
 const RC: H3Code = H3Code::REQUEST_CANCELLED;
+const MESSAGE_ERROR: H3Code = H3Code::MESSAGE_ERROR;
 
 #[test]
 fn extended_connect_tunnel_echo() {
@@ -825,4 +829,166 @@ fn failed_claim_does_not_strand_the_request() {
         info.__debug_buffers().0
     });
     assert!(left.is_empty(), "streams left: {left:?}");
+}
+
+/// `OnUpgrade::abort` before the response: the peer sees the code, the future yields the
+/// local abort, and a 200 returned afterwards is not sent.
+#[test]
+fn on_upgrade_abort_before_response() {
+    let mut p = plain();
+    let exec = p.exec.clone();
+    run(&exec, async {
+        let (resp, (mut req, tx)) = request(&mut p, connect()).await;
+        let mut on = upgrade::on(&mut req);
+        drop(req);
+        on.abort(MESSAGE_ERROR);
+        let _ = tx.send(reply(200, ""));
+        let e = (&mut on).await.expect_err("aborted");
+        assert!(is_aborted(&e, MESSAGE_ERROR, AbortSource::Local), "{e:?}");
+        assert!(
+            matches!(
+                e.kind(),
+                ErrorKind::StreamAborted {
+                    retryable: false,
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+        let e = out(&resp).await.expect_err("no response");
+        assert!(is_aborted(&e, MESSAGE_ERROR, AbortSource::Peer), "{e:?}");
+        quiesce().await;
+    });
+    let code = Some(MESSAGE_ERROR.0);
+    assert!(
+        reset_by(&p.net, Side::Server, S0) == code || stopped_by(&p.net, Side::Server, S0) == code
+    );
+    assert!(!fin_by(&p.net, Side::Server, S0), "{:?}", p.net.trace());
+}
+
+#[test]
+fn on_upgrade_abort_idempotent() {
+    let mut p = plain();
+    let exec = p.exec.clone();
+    run(&exec, async {
+        let (_resp, (mut req, _tx)) = request(&mut p, connect()).await;
+        let on = upgrade::on(&mut req);
+        drop(req);
+        on.abort(MESSAGE_ERROR);
+        on.abort(H3Code::INTERNAL_ERROR);
+        quiesce().await;
+    });
+    let n = p
+        .net
+        .trace()
+        .iter()
+        .filter(|o| matches!(o, MockObs::Reset { side: Side::Server, stream, .. } if *stream == S0))
+        .count();
+    assert_eq!(n, 1, "{:?}", p.net.trace());
+    assert_eq!(reset_by(&p.net, Side::Server, S0), Some(MESSAGE_ERROR.0));
+}
+
+#[test]
+fn on_upgrade_abort_client_side() {
+    let mut p = plain();
+    let exec = p.exec.clone();
+    run(&exec, async {
+        let (resp, (mut req, tx)) = request(&mut p, connect()).await;
+        let on = upgrade::on(&mut req);
+        drop(req);
+        tx.send(reply(200, "")).unwrap();
+        let mut server = on.await.expect("server tunnel");
+        let mut resp = out(&resp).await.expect("a response");
+        let on = upgrade::on(&mut resp);
+        on.abort(MESSAGE_ERROR);
+        let e = on.await.expect_err("aborted");
+        assert!(is_aborted(&e, MESSAGE_ERROR, AbortSource::Local), "{e:?}");
+        let e = server.recv().await.expect_err("aborted");
+        assert!(is_aborted(&e, MESSAGE_ERROR, AbortSource::Peer), "{e:?}");
+    });
+    assert_eq!(reset_by(&p.net, Side::Client, S0), Some(MESSAGE_ERROR.0));
+}
+
+/// The claim waits after the peer's FIN (so the abort skips receive-side wakeups); `abort`
+/// wakes it and it completes with the local abort.
+#[test]
+fn on_upgrade_abort_wakes_pending_claim() {
+    struct Flag(AtomicBool);
+    impl ArcWake for Flag {
+        fn wake_by_ref(a: &Arc<Self>) {
+            a.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let (net, c, s) = MockNet::pair();
+    let exec = TestExec::default();
+    let (tx, mut reqs) = mpsc::unbounded();
+    let srv = Builder::new().serve_connection(s, Handoff(tx), exec.clone());
+    let shared = srv.driver.shared();
+    spawn(&exec, srv);
+    let mut peer = CorePeer::new(Role::Client, Config::default(), c);
+    run(&exec, async {
+        let s = peer.open_bidi().await.unwrap();
+        let fields = [(":method", "CONNECT"), (":authority", "a:443")];
+        peer.send_headers(s, &fields, true).unwrap();
+        let (mut req, _tx) = drive(&mut peer, &mut reqs.next()).await.unwrap();
+        let mut on = upgrade::on(&mut req);
+        drop(req);
+        peer.run_until(|_| shared.with(|i| i.streams[&s].recv.eof))
+            .await;
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = futures::task::waker(flag.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut on).poll(&mut cx).is_pending());
+        on.abort(MESSAGE_ERROR);
+        assert!(flag.0.load(Ordering::SeqCst), "the claim was not woken");
+        let Poll::Ready(Err(e)) = Pin::new(&mut on).poll(&mut cx) else {
+            panic!("must complete");
+        };
+        assert!(is_aborted(&e, MESSAGE_ERROR, AbortSource::Local), "{e:?}");
+    });
+    drop(net);
+}
+
+/// A peer reset recorded before `abort` stays the claim's result: the abort does not
+/// replace it with the local code.
+#[test]
+fn on_upgrade_abort_keeps_earlier_peer_reset() {
+    let mut p = plain();
+    let exec = p.exec.clone();
+    run(&exec, async {
+        let (resp, (mut req, tx)) = request(&mut p, connect()).await;
+        let on = upgrade::on(&mut req);
+        drop(req);
+        tx.send(reply(200, "")).unwrap();
+        let server = on.await.expect("server tunnel");
+        let mut resp = out(&resp).await.expect("a response");
+        let on = upgrade::on(&mut resp);
+        server.abort(H3Code::INTERNAL_ERROR);
+        quiesce().await;
+        on.abort(MESSAGE_ERROR);
+        let e = on.await.expect_err("reset");
+        assert!(
+            is_aborted(&e, H3Code::INTERNAL_ERROR, AbortSource::Peer),
+            "{e:?}"
+        );
+    });
+}
+
+/// A code the core refuses (`H3_REQUEST_REJECTED` on a delivered request) makes `abort` a
+/// no-op: the 200 that follows still opens the tunnel.
+#[test]
+fn on_upgrade_abort_refused_code_is_noop() {
+    let mut p = plain();
+    let exec = p.exec.clone();
+    run(&exec, async {
+        let (resp, (mut req, tx)) = request(&mut p, connect()).await;
+        let on = upgrade::on(&mut req);
+        drop(req);
+        on.abort(H3Code::REQUEST_REJECTED);
+        tx.send(reply(200, "")).unwrap();
+        let mut resp = out(&resp).await.expect("a response");
+        let _client = upgrade::on(&mut resp).await.expect("client tunnel");
+        on.await.expect("server tunnel");
+    });
+    assert!(!aborted_any(&p.net, S0), "{:?}", p.net.trace());
 }

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 mp0rta
-//! HTTP datagrams in the driver (spec §3.4): send what the handles queued, drain the
-//! transport within the work budget, and route each datagram. Routing never waits on a
-//! handle: every queue is bounded and drops its oldest entry.
+//! HTTP datagrams in the driver (spec §3.4): send what the handles queued and drain the
+//! transport, each within its own work budget (spec §3.3), and route each datagram.
+//! Routing never waits on a handle: every queue is bounded and drops its oldest entry.
 //!
 //! | `parse_datagram` | stream | action |
 //! |---|---|---|
@@ -54,8 +54,10 @@ pub(crate) struct Dgrams {
     pub pending_bytes: usize,
     /// Prefixed datagrams the handles queued for the transport (drop-oldest).
     pub out: VecDeque<Bytes>,
-    /// Capacity of a registered queue, and of `out`.
-    pub queue_cap: usize,
+    /// Capacity of a registered handle's queue.
+    pub recv_cap: usize,
+    /// Capacity of `out`.
+    pub send_cap: usize,
     /// Pending caps (count, bytes): per stream, per connection.
     pub stream_cap: (usize, usize),
     pub conn_cap: (usize, usize),
@@ -65,7 +67,8 @@ impl Dgrams {
     pub(crate) fn new(b: &Builder, on: bool) -> Self {
         Dgrams {
             on,
-            queue_cap: b.datagram_queue,
+            recv_cap: b.datagram_recv_queue,
+            send_cap: b.datagram_send_queue,
             stream_cap: b.pending_dgrams_stream,
             conn_cap: b.pending_dgrams_conn,
             ..Dgrams::default()
@@ -126,7 +129,7 @@ impl Inner {
     /// handle's queue. A stream already decided without registration stays so: its
     /// datagrams keep aborting it.
     pub(crate) fn register_datagrams(&mut self, id: StreamId) {
-        let cap = self.dgram.queue_cap;
+        let cap = self.dgram.recv_cap;
         let Some(d) = self.streams.get_mut(&id).map(|s| &mut s.dgram) else {
             return;
         };
@@ -164,7 +167,7 @@ impl Inner {
             return; // NotYetOpen, Drop
         };
         let b = own(&payload, range);
-        let cap = self.dgram.queue_cap;
+        let cap = self.dgram.recv_cap;
         let Some(d) = self.streams.get_mut(&id).map(|s| &mut s.dgram) else {
             return;
         };
@@ -182,18 +185,20 @@ impl Inner {
 }
 
 impl<C: quic::Connection> Driver<C> {
-    /// Refresh the limit, hand the queued datagrams to the transport, then receive and
-    /// route datagrams while the budget lasts.
+    /// Refresh the limit, hand queued datagrams to the transport, then receive and route
+    /// datagrams, each while its budget (send, receive) lasts; the rest stay queued.
     pub(super) fn datagrams(
         &mut self,
         cx: &mut Context<'_>,
-        budget: &mut usize,
+        (send_budget, budget): &mut (usize, usize),
     ) -> Result<bool, TransportError> {
         let limit = self.conn.max_datagram_size();
         let (on, out) = self.shared.with(|i| {
             i.dgram.limit = limit;
-            (i.dgram.on, std::mem::take(&mut i.dgram.out))
+            let n = i.dgram.out.len().min(*send_budget);
+            (i.dgram.on, i.dgram.out.drain(..n).collect::<Vec<_>>())
         });
+        *send_budget -= out.len();
         let mut moved = !out.is_empty();
         for d in out {
             // TooLarge (the limit shrank since `send`) or Unsupported: lost, as a

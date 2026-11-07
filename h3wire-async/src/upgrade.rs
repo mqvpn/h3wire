@@ -25,7 +25,7 @@ use crate::error::{Error, ErrorKind};
 use crate::slot::OnceSlot;
 use crate::state::{Dir, End, Inner, Shared, Up};
 use bytes::Bytes;
-use h3wire::{H3Code, StreamId, UsageError};
+use h3wire::{AbortSource, H3Code, StreamId, UsageError};
 use http::{Request, Response};
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
@@ -141,6 +141,40 @@ pub fn on<T: Upgradable>(msg: &mut T) -> OnUpgrade {
 /// Resolves to the [`Tunnel`] once a 2xx went out (server) or at once (client).
 pub struct OnUpgrade {
     claim: Option<Claim>,
+}
+
+impl OnUpgrade {
+    /// Abort the whole request with `code`, e.g. to reject a CONNECT before any response;
+    /// idempotent. This future then resolves to `StreamAborted { code, Local }` (or to
+    /// the stream's earlier failure, such as a peer reset), and a response returned
+    /// afterwards is discarded. Does nothing without a claim, or when the core refuses
+    /// the abort (a closed connection, a code it forbids such as `H3_REQUEST_REJECTED`
+    /// on a delivered request, or one above 2^62 - 1).
+    pub fn abort(&self, code: H3Code) {
+        let Some(c) = &self.claim else { return };
+        c.shared.with(|i| {
+            if !i.abort_local(c.id, code) {
+                return;
+            }
+            let Some(st) = i.streams.get_mut(&c.id) else {
+                return;
+            };
+            if matches!(st.up, Up::Claimed | Up::Active) {
+                // An earlier failure (e.g. a peer reset) stays the result.
+                let e = st.recv.error.clone().unwrap_or_else(|| {
+                    ErrorKind::StreamAborted {
+                        code,
+                        source: AbortSource::Local,
+                        retryable: false,
+                    }
+                    .into()
+                });
+                st.up = Up::Failed(e);
+                // A receive side already finished is not woken by the abort.
+                i.pending_wakers.extend(st.recv.waker.take());
+            }
+        });
+    }
 }
 
 impl std::fmt::Debug for OnUpgrade {
@@ -277,7 +311,9 @@ impl Tunnel {
 /// Abort the whole request with `code`; idempotent. It is recorded at once, so the other
 /// half sees `StreamAborted { code, source: Local }` immediately.
 fn abort(shared: &Shared, id: StreamId, code: H3Code) {
-    shared.with(|i| i.abort_local(id, code));
+    shared.with(|i| {
+        i.abort_local(id, code);
+    });
 }
 
 /// The sending half of a [`Tunnel`].

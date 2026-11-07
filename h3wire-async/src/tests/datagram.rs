@@ -8,12 +8,15 @@ use super::client::{client, drive, get, seen};
 use super::driver::{done, poll_once, spawn, take};
 use super::recv::{held_bytes, yield_now};
 use super::upgrade::{
-    Handed, Handoff, aborted_any, connect, out, plain, reply, request, reset_by, stopped_by, until,
+    Handed, Handoff, Pair, aborted_any, connect, out, pair, plain, reply, request, reset_by,
+    stopped_by, until,
 };
 use crate::__testing::exec::{TestExec, run};
 use crate::__testing::{CorePeer, MockConn, MockNet, MockObs, PeerObs, Side};
 use crate::builder::Builder;
-use crate::datagram::{DatagramSlot, Datagrams, RegisterDatagrams};
+use crate::datagram::{
+    DatagramReceiver, DatagramSender, DatagramSlot, Datagrams, RegisterDatagrams,
+};
 use crate::error::{DatagramError, ErrorKind};
 use crate::ext::ConnInfo;
 use crate::upgrade;
@@ -90,6 +93,18 @@ async fn wait(peer: &mut Peer, mut pred: impl FnMut(&Peer) -> bool) {
         yield_now().await;
     }
     panic!("condition not reached: {:?}", peer.trace());
+}
+
+/// Step the peer and let every task run a fixed number of times (nothing to wait on).
+async fn settle(peer: &mut Peer) {
+    for _ in 0..64 {
+        poll_fn(|cx| {
+            while peer.poll_step(cx).is_ready() {}
+            Poll::Ready(())
+        })
+        .await;
+        yield_now().await;
+    }
 }
 
 /// The next datagram of `d`, stepping the peer meanwhile.
@@ -271,7 +286,7 @@ fn registered_rejected_connect_drops_silently() {
         assert_eq!(next(&mut peer, &mut d).await, None, "the request ended");
         drop(req);
         drop(d);
-        wait(&mut peer, |_| true).await;
+        settle(&mut peer).await;
         assert!(!aborted_any(&net, s), "{:?}", net.trace());
     });
 }
@@ -491,6 +506,71 @@ fn datagram_receive_never_blocks_driver() {
     });
 }
 
+/// Sends are budgeted too: one `poll` hands at most `work_budget` queued datagrams to
+/// the transport, and the rest go on later polls.
+#[test]
+fn datagram_send_within_budget() {
+    let (net, c, s) = MockNet::pair();
+    let exec = TestExec::default();
+    let (tx, mut reqs) = mpsc::unbounded();
+    let mut b = Builder::new();
+    b.work_budget(4);
+    let mut srv = b.serve_connection(s, Handoff(tx), exec.clone());
+    let mut peer = CorePeer::new(Role::Client, peer_cfg(true), c);
+    let sent = |net: &MockNet| {
+        let t = net.trace();
+        t.iter()
+            .filter(|o| {
+                matches!(
+                    o,
+                    MockObs::Datagram {
+                        side: Side::Server,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    run(&exec, async {
+        async fn go<F: Future + Unpin>(
+            peer: &mut Peer,
+            srv: &mut (impl Future + Unpin),
+            f: &mut F,
+        ) -> F::Output {
+            poll_fn(|cx| {
+                loop {
+                    if let Poll::Ready(v) = Pin::new(&mut *f).poll(cx) {
+                        return Poll::Ready(v);
+                    }
+                    assert!(Pin::new(&mut *srv).poll(cx).is_pending());
+                    if peer.poll_step(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                }
+            })
+            .await
+        }
+        let s = peer.open_bidi().await.unwrap();
+        peer.send_headers(s, &POST, false).unwrap();
+        let (req, _tx) = go(&mut peer, &mut srv, &mut reqs.next()).await.unwrap();
+        let d = slot(&req).register().unwrap();
+        while d.max_payload().is_none() || peer.core().peer_settings().is_none() {
+            go(&mut peer, &mut srv, &mut pin!(yield_now())).await;
+        }
+        let before = sent(&net);
+        for n in 0..50u8 {
+            d.send(Bytes::from(vec![n])).unwrap();
+        }
+        assert!(poll_once(&mut srv).await.is_pending());
+        let n = sent(&net) - before;
+        assert!(n > 0 && n <= 4, "{n} sent in one poll");
+        for _ in 0..20 {
+            assert!(poll_once(&mut srv).await.is_pending());
+        }
+        assert_eq!(sent(&net) - before, 50);
+    });
+}
+
 #[test]
 fn slot_clone_single_registration() {
     let mut p = plain();
@@ -564,4 +644,146 @@ fn tiny_datagrams_do_not_pin_packet_buffers() {
             "{held} bytes kept alive by 16 datagrams"
         );
     });
+}
+
+/// A registered CONNECT over a plain pair: server and client handles, plus the handles
+/// that keep the exchange alive.
+async fn registered(p: &mut Pair) -> (Datagrams, Datagrams, impl Sized + use<>) {
+    let mut r = connect();
+    r.extensions_mut().insert(RegisterDatagrams);
+    let (resp, (mut req, tx)) = request(p, r).await;
+    let sd = slot(&req).register().expect("server handle");
+    let on = upgrade::on(&mut req);
+    tx.send(reply(200, "")).unwrap();
+    let resp = out(&resp).await.expect("a response");
+    let cd = resp_slot(&resp).unwrap().register().expect("client handle");
+    until(|| cd.max_payload().is_some() && sd.max_payload().is_some()).await;
+    (sd, cd, (on, req, resp))
+}
+
+fn _assert_auto_traits() {
+    fn send_sync_clone<T: Send + Sync + Clone>() {}
+    fn send<T: Send>() {}
+    send_sync_clone::<DatagramSender>();
+    send::<DatagramReceiver>();
+}
+
+#[test]
+fn split_send_and_recv_independent() {
+    let mut p = plain();
+    let exec = p.exec.clone();
+    run(&exec, async {
+        let (sd, cd, _keep) = registered(&mut p).await;
+        let (stx, mut srx) = sd.split();
+        let (ctx, _crx) = cd.split();
+        let sender = ctx.clone();
+        // From another task while `recv` is pending.
+        let sent = spawn(&exec, async move {
+            sender.send(Bytes::from_static(b"hi")).unwrap();
+        });
+        assert_eq!(srx.recv().await.unwrap().unwrap(), "hi");
+        until(|| sent.lock().unwrap().is_some()).await;
+        assert_eq!(ctx.max_payload(), stx.max_payload());
+    });
+}
+
+#[test]
+fn split_registration_held_until_both_dropped() {
+    let (net, info, mut peer, mut reqs, exec) = server(&Builder::new(), true);
+    run(&exec, async {
+        let (s, (mut req, tx)) = open(&mut peer, &mut reqs, &CONNECT).await;
+        let (stx, srx) = slot(&req).register().unwrap().split();
+        let _on = upgrade::on(&mut req);
+        tx.send(reply(200, "")).unwrap();
+        wait(&mut peer, |p| {
+            seen(p, s) && p.core().peer_settings().is_some()
+        })
+        .await;
+        until(|| stx.max_payload().is_some()).await;
+        drop(srx);
+        stx.send(Bytes::from_static(b"after")).unwrap();
+        wait(&mut peer, |p| peer_got(p, s, 5)).await;
+        drop(stx);
+        peer.send_datagram(s, b"late").unwrap();
+        settle(&mut peer).await;
+        assert!(!dg_abort(&net, Side::Server, s), "{:?}", net.trace());
+        assert!(!aborted_any(&net, s), "{:?}", net.trace());
+        assert_eq!(info.__debug_datagram_accounting(), (0, 0, 0), "discarded");
+    });
+}
+
+#[test]
+fn split_clone_counts_users() {
+    let mut p = plain();
+    let exec = p.exec.clone();
+    run(&exec, async {
+        let (_sd, cd, _keep) = registered(&mut p).await;
+        let users = || p.send.shared.with(|i| i.streams[&StreamId(0)].users);
+        let before = users();
+        let (tx, rx) = cd.split();
+        let tx2 = tx.clone();
+        assert_eq!(users(), before);
+        drop((rx, tx));
+        assert_eq!(users(), before, "a clone is left");
+        drop(tx2);
+        assert_eq!(users(), before - 1);
+    });
+}
+
+#[test]
+fn recv_queue_cap_is_per_request() {
+    let mut b = Builder::new();
+    b.datagram_recv_queue(2).unwrap();
+    let (net, _info, mut peer, mut reqs, exec) = server(&b, true);
+    run(&exec, async {
+        let (s0, (r0, _t0)) = open(&mut peer, &mut reqs, &CONNECT).await;
+        let (s4, (r4, _t4)) = open(&mut peer, &mut reqs, &CONNECT).await;
+        negotiated(&mut peer).await;
+        let mut d0 = slot(&r0).register().unwrap();
+        let mut d4 = slot(&r4).register().unwrap();
+        for m in ["0", "1", "2", "3", "4"] {
+            peer.send_datagram(s0, m.as_bytes()).unwrap();
+        }
+        peer.send_datagram(s4, b"a").unwrap();
+        settle(&mut peer).await;
+        for m in ["3", "4"] {
+            assert_eq!(next(&mut peer, &mut d0).await.unwrap(), m);
+        }
+        assert_eq!(next(&mut peer, &mut d4).await.unwrap(), "a");
+        assert!(!aborted_any(&net, s0) && !aborted_any(&net, s4));
+    });
+}
+
+#[test]
+fn send_queue_cap_is_per_connection() {
+    let mut b = Builder::new();
+    b.datagram_send_queue(3).unwrap();
+    let mut p = pair(&Builder::new(), &b);
+    let exec = p.exec.clone();
+    run(&exec, async {
+        let (sd, cd, _keep) = registered(&mut p).await;
+        // No await between the sends: the driver has not run.
+        for n in 1..=5 {
+            sd.send(Bytes::from(vec![7; n])).unwrap();
+        }
+        let mut cd = cd;
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            got.push(cd.recv().await.unwrap().unwrap().len());
+        }
+        assert_eq!(got, [3, 4, 5]);
+    });
+}
+
+#[test]
+fn zero_queue_rejected() {
+    let mut b = Builder::new();
+    assert!(matches!(
+        b.datagram_recv_queue(0),
+        Err(h3wire::UsageError::OutOfRange)
+    ));
+    assert!(matches!(
+        b.datagram_send_queue(0),
+        Err(h3wire::UsageError::OutOfRange)
+    ));
 }

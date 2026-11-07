@@ -9,7 +9,7 @@ The QUIC transport plugs in through the poll-based traits in `h3wire_async::quic
 application supplies the executor (`rt::Executor`); the `tokio` feature adds
 `rt::TokioExecutor`.
 
-> **Note:** h3wire-async's API is unstable until the v0.3 MASQUE milestone: expect 0.x minor bumps; patches never break.
+> **Note:** h3wire-async is a stable candidate; 1.0 waits for a downstream user outside this workspace.
 
 ## Usage
 
@@ -28,6 +28,31 @@ let resp = send.send_request(request).await?;
 ```
 
 See the [API documentation](https://docs.rs/h3wire-async).
+
+## Changelog
+
+### 0.2.0
+
+Breaking:
+
+- `datagram_queue` is replaced by the fallible `datagram_recv_queue` and
+  `datagram_send_queue`; a size of 0 is rejected.
+
+Added:
+
+- `OnUpgrade::abort` aborts a CONNECT before its response: on the server, before the
+  response is sent; on the client, before the tunnel is taken.
+- `Datagrams::split` yields a `Clone` `DatagramSender` and a `DatagramReceiver`.
+- `DatagramError` implements `Display` and `std::error::Error`.
+
+Changed:
+
+- Requests that were never sent when GOAWAY arrives are retryable.
+- `work_budget(n)` is counted separately for stream work, datagram send and datagram
+  receive, so none starves another; one driver poll may do up to 3 × `n` transport
+  operations.
+- A dropped `ConnInfo::settings` or `SendRequest::settings` wait unregisters its waker
+  (it was kept until SETTINGS or close).
 
 ## License
 

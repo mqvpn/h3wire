@@ -192,6 +192,26 @@ fn driver_drop_closes_no_error() {
     assert_eq!(net.closed_with(Side::Client), Some(0x100));
 }
 
+/// A dropped `settings` wait leaves no waker behind (a peer that never sends SETTINGS
+/// must not make cancelled waits pile up).
+#[test]
+fn settings_wait_unregisters_on_drop() {
+    let (_net, driver, mut peer) = setup(Role::Server, &Builder::new(), Config::default());
+    peer.defer_control(true);
+    let shared = driver.shared();
+    let info = ConnInfo::new(shared.clone());
+    let exec = TestExec::default();
+    run(&exec, async {
+        for _ in 0..2 {
+            let mut w = pin!(info.settings());
+            assert!(poll_once(&mut w).await.is_pending());
+            assert!(poll_once(&mut w).await.is_pending());
+        }
+    });
+    assert_eq!(shared.with(|i| i.conn_wakers.len()), 0);
+    drop(driver);
+}
+
 fn kind(r: Result<(), Error>) -> ErrorKind {
     r.expect_err("driver must fail").kind().clone()
 }
@@ -351,4 +371,136 @@ fn server_peer_transport_close() {
             ),
         }
     }
+}
+
+/// A server with `work_budget(8)`, eight flood requests and request B (registered for
+/// datagrams); the peer sends `chunks` one-byte DATA frames (each its own transport
+/// chunk) on each flood request and `dgrams` datagrams for B. A round reads each ready
+/// stream once, so eight flooded streams spend the whole budget every pass. Then the
+/// server is polled `polls` times, the flood bodies and B's handle drained after each
+/// poll: the (flood bytes, B datagrams) each poll delivered.
+fn flood(chunks: usize, dgrams: usize, polls: usize) -> Vec<(usize, usize)> {
+    use super::upgrade::Handoff;
+    use crate::datagram::DatagramSlot;
+    use futures::channel::mpsc;
+    use http_body::Body;
+
+    fn step(
+        exec: &TestExec,
+        srv: &mut (impl Future + Unpin),
+        peer: &mut CorePeer<MockConn>,
+        cx: &mut Context<'_>,
+    ) {
+        exec.tick(cx);
+        let _ = Pin::new(srv).poll(cx);
+        let _ = peer.poll_step(cx);
+    }
+    const POST: [(&str, &str); 4] = [
+        (":method", "POST"),
+        (":scheme", "https"),
+        (":authority", "a"),
+        (":path", "/"),
+    ];
+    let (_net, c, s) = MockNet::pair();
+    let exec = TestExec::default();
+    let (tx, mut reqs) = mpsc::unbounded();
+    let mut b = Builder::new();
+    b.work_budget(8);
+    let mut srv = b.serve_connection(s, Handoff(tx), exec.clone());
+    let mut cfg = Config::default();
+    cfg.h3_datagram = true;
+    let mut peer = CorePeer::new(Role::Client, cfg, c);
+    let noop = noop_waker();
+    let cx = &mut Context::from_waker(&noop);
+    let mut opened = Vec::new();
+    for _ in 0..9 {
+        let id = pin!(peer.open_bidi()).poll(cx);
+        let Poll::Ready(Ok(id)) = id else {
+            panic!("no stream credit")
+        };
+        peer.send_headers(id, &POST, false).unwrap();
+        let mut got = None;
+        for _ in 0..1000 {
+            if let Ok(h) = reqs.try_recv() {
+                got = Some(h);
+                break;
+            }
+            step(&exec, &mut srv, &mut peer, cx);
+        }
+        opened.push((id, got.expect("a request")));
+    }
+    let (b_id, (req_b, _rb)) = opened.pop().unwrap();
+    let mut d = req_b
+        .extensions()
+        .get::<DatagramSlot>()
+        .expect("a slot")
+        .register()
+        .unwrap();
+    for _ in 0..1000 {
+        if d.max_payload().is_some() && peer.core().peer_settings().is_some() {
+            break;
+        }
+        step(&exec, &mut srv, &mut peer, cx);
+    }
+    assert!(d.max_payload().is_some());
+    for _ in 0..chunks {
+        for (a, _) in &opened {
+            peer.send_raw(*a, &[0x00, 0x01, b'x']);
+        }
+    }
+    for n in 0..dgrams {
+        peer.send_datagram(b_id, &n.to_be_bytes()).unwrap();
+    }
+    while peer.poll_step(cx).is_ready() {}
+    let mut bodies: Vec<_> = opened
+        .into_iter()
+        .map(|(_, (r, reply))| (r.into_body(), reply))
+        .collect();
+    (0..polls)
+        .map(|_| {
+            let _ = Pin::new(&mut srv).poll(cx);
+            let mut bytes = 0;
+            for (body, _) in &mut bodies {
+                while let Poll::Ready(Some(Ok(f))) = Pin::new(&mut *body).poll_frame(cx) {
+                    bytes += f.into_data().map_or(0, |d| d.len());
+                }
+            }
+            let mut n = 0;
+            while let Poll::Ready(Ok(Some(_))) = pin!(d.recv()).poll(cx) {
+                n += 1;
+            }
+            (bytes, n)
+        })
+        .collect()
+}
+
+#[test]
+fn datagrams_not_starved_by_stream_work() {
+    let got = flood(2000, 100, 100);
+    let mut total = 0;
+    for (i, &(a, n)) in got.iter().enumerate() {
+        if total == 100 {
+            break;
+        }
+        // The stream flood is still running in this poll window.
+        assert!(a > 0, "poll {i}: no stream work");
+        assert!(n >= 1, "poll {i}: no datagram among {got:?}");
+        total += n;
+    }
+    assert_eq!(total, 100);
+}
+
+#[test]
+fn streams_not_starved_by_datagram_flood() {
+    let got = flood(13, 2000, 100);
+    let mut total = 0;
+    for (i, &(a, n)) in got.iter().enumerate() {
+        if total == 8 * 13 {
+            break;
+        }
+        assert!(n > 0, "poll {i}: no datagram work");
+        assert!(a >= 1, "poll {i}: no stream bytes among {got:?}");
+        total += a;
+    }
+    assert_eq!(total, 8 * 13);
 }

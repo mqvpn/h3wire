@@ -24,7 +24,10 @@ Files in `interop/`:
   if the tag moved), the h3spec release binary (URL and SHA-256), and the base images.
   These change only by a deliberate PR.
 - `Dockerfile.peers` builds curl, the ngtcp2 example client and server, quiche-client
-  and quiche-server, and adds h3spec. `Dockerfile.h3wire` builds our examples.
+  and quiche-server, masque-go's client and proxy, and adds socat and h3spec.
+  `Dockerfile.h3wire` builds our examples.
+- `masque-go.patch` is the one change to masque-go's `cmd/client` the harness needs
+  (see [MASQUE](#masque)).
 - `cells.tsv` is the matrix: `capability  peer  version  direction  command  status`.
   A `mandatory` cell runs its exact command; an `unsupported-by-peer-tooling` cell
   records in its command column why no command exists.
@@ -109,9 +112,10 @@ Unsupported by peer tooling:
      rejects `:protocol`; `--dgram-proto` sends datagrams without Extended CONNECT);
    - curl 8.21+ speaks CONNECT-UDP only as the client of an HTTP/3 proxy
      (`--proxy-http3`, experimental, needs a `USE_PROXY_HTTP3` build). That needs a proxy
-     that forwards to a target, and our server only echoes.
+     that forwards to a target, which the echo server is not.
 
-   MASQUE interop moves to v0.3. The echo route itself was checked locally
+   MASQUE interop is against masque-go, in [MASQUE](#masque). The echo route itself
+   was checked locally
    with the h3wire client: a 200 with `capsule-protocol: ?1`, context-ID-0 datagrams
    echoed, other context IDs dropped, and capsule bytes echoed until FIN.
 
@@ -129,6 +133,61 @@ Recorded from the cell logs:
   complete response. Our client keeps that response, as RFC 9114 §4.1 requires: the
   status (405 for POST, 200 for a GET with a body) and the body arrive, and the
   connection closes cleanly. This was checked by hand, outside the matrix.
+
+## MASQUE
+
+CONNECT-UDP (RFC 9298) against [masque-go](https://github.com/quic-go/masque-go),
+`cmd/client` and `cmd/proxy` at the tag pinned in `versions.env`. Our side is
+`h3wire-masque/examples/{proxy,client}.rs`. The cells are rows of `cells.tsv` and run
+with the rest of the matrix (`interop/run.sh`).
+
+- **masque-go client → our proxy** (peer → h3wire): `masque-go-client -t <our
+  template> https://h3wire:4433/bytes/1048576` dials an HTTP/3 connection to our
+  server through a CONNECT-UDP tunnel on our proxy, fetches 1 MiB and writes it to
+  stdout; the cell checks its SHA-256. The tunnelled connection is the one the clean
+  close check applies to: our server must log it as `closed cleanly`.
+- **our client → masque-go proxy** (h3wire → peer): `h3wire-masque-client --target
+  udp-echo:4433 --count 10 --expect-echo` sends 10 numbered probes through masque-go's
+  proxy to a UDP echo (`socat`, one child per datagram so payloads are never
+  coalesced). It passes when at least one echo returns and every echo is a probe.
+
+Both run on the datagram carrier. The templates are
+`https://<proxy>:4433/.well-known/masque/udp/{target_host}/{target_port}/`.
+
+Our proxy does the RFC 9298 §3.1 duties: it resolves the target and connects a UDP
+socket to it before the 200 (so packets from other sources are dropped), sets the
+Don't Fragment bit (`IP_MTU_DISCOVER`/`IPV6_MTU_DISCOVER` = `DO`, Linux only; it exits
+at startup elsewhere) and drops a payload refused with `EMSGSIZE`, and ends the socket
+and the tunnel together. Its QUIC initial MTU is 1350 so a datagram can carry a
+tunnelled QUIC packet from the start.
+
+`interop/masque-go.patch` changes only the client, and no protocol behaviour:
+
+- `-ca FILE` trusts our test certificate (the stock client uses the system roots);
+- the body is written to stdout as raw bytes (the stock client logs it);
+- before exit it closes the tunnelled connection with `H3_NO_ERROR`, waits 200 ms for
+  that CONNECTION_CLOSE datagram to leave, then closes the tunnel and the proxy
+  connection (the stock client exits without closing).
+
+Run on 2026-11-07 with h3wire `09a177d` plus this change: both mandatory cells passed,
+and the tunnelled connection closed cleanly at our server.
+
+| capability | peer | version | direction | result |
+|---|---|---|---|---|
+| CONNECT-UDP (datagram) | masque-go client | masque-go v0.6.0 | peer → h3wire | pass |
+| CONNECT-UDP (datagram) | masque-go proxy | masque-go v0.6.0 | h3wire → peer | pass |
+| CONNECT-UDP (capsule) | masque-go client | masque-go v0.6.0 | peer → h3wire | unsupported (4) |
+| CONNECT-UDP (capsule) | masque-go proxy | masque-go v0.6.0 | h3wire → peer | unsupported (4) |
+
+4. masque-go needs QUIC datagrams. Its client refuses a connection without them
+   (`Transport.Dial`, `Transport.NewClientConn`, and the SETTINGS check in
+   `ClientConn.dial`), and its proxy only relays HTTP datagrams: it reads and discards
+   the capsules on the request stream. Neither side exercises the capsule carrier,
+   which is covered by `h3wire-masque`'s own tests.
+
+Observed: masque-go's client closes its connection to the proxy with application code
+0, not `H3_NO_ERROR`, so our proxy logs that connection as `closed with error:
+transport error (peer closed with 0x0)`. The cell does not check the proxy's log.
 
 ## h3spec
 

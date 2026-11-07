@@ -26,6 +26,7 @@ use crate::state::{Inner, Shared};
 use bytes::{Bytes, BytesMut};
 use h3wire::{StreamId, UsageError};
 use std::future::poll_fn;
+use std::sync::Arc;
 use std::task::Poll;
 
 /// Client: register HTTP datagram semantics for this request (put it in the request's
@@ -115,7 +116,7 @@ impl Datagrams {
             let mut b = BytesMut::with_capacity(n + data.len());
             b.extend_from_slice(&p[..n]);
             b.extend_from_slice(&data);
-            let cap = i.dgram.queue_cap;
+            let cap = i.dgram.send_cap;
             push_bounded(&mut i.dgram.out, cap, b.freeze());
             i.wake_driver();
             Ok(())
@@ -125,6 +126,19 @@ impl Datagrams {
     /// The next datagram. `Ok(None)` once the request ended normally (no datagram can
     /// arrive after its receive side ended); an abort or the connection's close fails it.
     pub async fn recv(&mut self) -> Result<Option<Bytes>, Error> {
+        self.recv_shared().await
+    }
+
+    /// Split into a cloneable sender and a receiver. The registration stays until every
+    /// clone and the receiver are gone: after the receiver is dropped, inbound datagrams
+    /// keep queueing (bounded, oldest evicted) while any sender lives.
+    pub fn split(self) -> (DatagramSender, DatagramReceiver) {
+        let d = Arc::new(self);
+        (DatagramSender(d.clone()), DatagramReceiver(d))
+    }
+
+    /// `recv` for a shared handle: only one receiver ever calls it.
+    async fn recv_shared(&self) -> Result<Option<Bytes>, Error> {
         let id = self.id;
         poll_fn(|cx| {
             self.shared.with(|i| {
@@ -152,7 +166,8 @@ impl Datagrams {
     }
 
     /// The largest payload [`send`](Self::send) accepts now: the transport's limit minus
-    /// this request's quarter stream id length. `None` until negotiation completes, or
+    /// this request's quarter stream id length, as of the driver's last pass (it can
+    /// change right after). `None` until negotiation completes, or
     /// when datagrams cannot be sent.
     pub fn max_payload(&self) -> Option<usize> {
         self.shared.with(|i| {
@@ -175,5 +190,32 @@ impl Drop for Datagrams {
             }
             i.release_user(id);
         });
+    }
+}
+
+/// The sending half of [`Datagrams::split`]; clones share it.
+#[derive(Clone, Debug)]
+pub struct DatagramSender(Arc<Datagrams>);
+
+impl DatagramSender {
+    /// As [`Datagrams::send`].
+    pub fn send(&self, data: Bytes) -> Result<(), DatagramError> {
+        self.0.send(data)
+    }
+
+    /// As [`Datagrams::max_payload`].
+    pub fn max_payload(&self) -> Option<usize> {
+        self.0.max_payload()
+    }
+}
+
+/// The receiving half of [`Datagrams::split`].
+#[derive(Debug)]
+pub struct DatagramReceiver(Arc<Datagrams>);
+
+impl DatagramReceiver {
+    /// As [`Datagrams::recv`].
+    pub async fn recv(&mut self) -> Result<Option<Bytes>, Error> {
+        self.0.recv_shared().await
     }
 }

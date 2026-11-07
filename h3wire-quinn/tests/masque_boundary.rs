@@ -723,3 +723,48 @@ async fn qsid_four_byte_varint() {
     })
     .await
 }
+
+/// 32 tunnels at once, each sending paced datagrams that carry its index: every tunnel
+/// gets echoes, and none gets another tunnel's. (An unpaced burst could legitimately
+/// lose all but the last tunnel's datagrams to the queues' drop-oldest.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fan_out_many_tunnels() {
+    use std::time::{Duration, Instant};
+    const N: u8 = 32;
+    const ECHOES: u32 = 3;
+    with_timeout(async {
+        let (mut p, mut reqs) = masque(&server_builder()).await;
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let Udp { ct, mut cd, st, sd } = open(&mut p, &mut reqs).await;
+            let proxy = proxy(st, sd);
+            set.spawn(async move {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let (mut seq, mut echoes) = (0u32, 0);
+                while echoes < ECHOES {
+                    assert!(Instant::now() < deadline, "tunnel {i}: {echoes} echoes");
+                    seq += 1;
+                    let mut msg = vec![i];
+                    msg.extend_from_slice(&seq.to_be_bytes());
+                    cd.send(udp(&msg)).unwrap();
+                    // Wait for an echo, or 50 ms, then send the next one.
+                    let wait = tokio::time::sleep(Duration::from_millis(50));
+                    tokio::pin!(wait);
+                    tokio::select! {
+                        d = cd.recv() => {
+                            let d = d.unwrap().unwrap();
+                            assert_eq!(d[1], i, "tunnel {i} got an echo of tunnel {}", d[1]);
+                            echoes += 1;
+                        }
+                        _ = &mut wait => {}
+                    }
+                }
+                close(ct, proxy).await;
+            });
+        }
+        while let Some(r) = set.join_next().await {
+            r.unwrap();
+        }
+    })
+    .await
+}

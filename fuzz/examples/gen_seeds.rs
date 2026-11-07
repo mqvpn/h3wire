@@ -576,6 +576,69 @@ fn qpack_seeds() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
+/// A capsule: type, length, value (varints per `varint`).
+fn capsule(ty: u64, value: &[u8]) -> Vec<u8> {
+    [varint(ty), varint(value.len() as u64), value.to_vec()].concat()
+}
+
+/// First byte: split size (0 = whole) and, with the head index, the action per capsule.
+fn capsule_seeds() -> Vec<(&'static str, Vec<u8>)> {
+    let valid = [
+        capsule(0x00, b"\x00hello"),
+        capsule(0x2a, &[9; 70]),
+        capsule(0x00, b""),
+        capsule(0x4040, b"\x41\x00tail"),
+    ]
+    .concat();
+    // Non-minimal: 8-byte type 0x00 and 4-byte length 2, then a 2-byte leading varint.
+    let non_minimal = [0xc0, 0, 0, 0, 0, 0, 0, 0x00, 0x80, 0, 0, 0x02, 0x40, 0x05];
+    let truncated = [valid.clone(), capsule(0x2a, &[1; 100])[..40].to_vec()].concat();
+    let with = |k: u8, b: &[u8]| [&[k][..], b].concat();
+    vec![
+        ("valid_whole", with(0, &valid)),
+        ("valid_split_1", with(1, &valid)),
+        ("valid_split_5", with(5, &valid)),
+        ("split_head", with(1, &capsule(0x4040, &[0; 3]))),
+        ("non_minimal", with(3, &non_minimal)),
+        ("truncated", with(7, &truncated)),
+    ]
+}
+
+/// `template`, a NUL byte, then a request URI.
+fn template_seeds() -> Vec<(&'static str, Vec<u8>)> {
+    let t = "https://proxy.example/.well-known/masque/udp/{target_host}/{target_port}/";
+    let with = |tpl: &str, uri: &str| [tpl.as_bytes(), b"\0", uri.as_bytes()].concat();
+    let p = "/.well-known/masque/udp";
+    vec![
+        ("default_ipv4", with(t, &format!("{p}/192.0.2.6/443/"))),
+        (
+            "default_ipv6",
+            with(t, &format!("{p}/2001%3Adb8%3A%3A1/443/")),
+        ),
+        (
+            "default_name",
+            with(t, &format!("{p}/a%25b%2Fc.example/53/")),
+        ),
+        ("zone_id", with(t, &format!("{p}/fe80%3A%3A1%25eth0/80/"))),
+        (
+            "query",
+            with("https://p/{target_port}/x/{target_host}?k=v", "/80/x/h?k=v"),
+        ),
+        (
+            "reject_http",
+            with("http://p/{target_host}/{target_port}/", "/h/80/"),
+        ),
+        (
+            "reject_partial",
+            with("https://p/x{target_host}/{target_port}/", "/xh/80/"),
+        ),
+        (
+            "reject_expr",
+            with("https://p/{+target_host}/{target_port}/", "/h/80/"),
+        ),
+    ]
+}
+
 fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("seeds");
     let targets = [
@@ -583,6 +646,8 @@ fn main() {
         ("qpack_decoder", qpack_seeds()),
         ("wire", wire_seeds()),
         ("api_ops", api_seeds()),
+        ("capsule_decoder", capsule_seeds()),
+        ("template_match", template_seeds()),
     ];
     for (target, seeds) in targets {
         let dir = root.join(target);

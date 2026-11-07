@@ -20,7 +20,10 @@
 # Variables for commands: H3WIRE, NGTCP2, QUICHE (server URLs), CA (our certificate),
 # POST (10 MiB of 'a'), SHA_1M and SHA_8M (SHA-256 of 1 MiB and 8 MiB of 'a', served as
 # /bytes/1048576 and /bytes/8388608 by every server), HEX_POST (SHA-256 of POST, which
-# our /sha256 returns), OUT (an empty directory for the cell).
+# our /sha256 returns), OUT (an empty directory for the cell), H3WIRE_PROXY_TEMPLATE and
+# MASQUE_GO_TEMPLATE (the CONNECT-UDP URI templates of our proxy and masque-go's).
+# MASQUE cells: our proxy (h3wire-proxy) and masque-go's (masque-go) forward to our
+# server or to a UDP echo (udp-echo:4433).
 set -euo pipefail
 start=$SECONDS
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -49,7 +52,10 @@ U="$(id -u):$(id -g)"
 docker network create "$NET" >/dev/null
 cleanup() {
     docker logs "$NET-h3wire" >"$W/h3wire-server.log" 2>&1 || true
-    docker rm -f "$NET-h3wire" "$NET-ngtcp2" "$NET-quiche" >/dev/null 2>&1 || true
+    docker logs "$NET-h3wire-proxy" >"$W/h3wire-proxy.log" 2>&1 || true
+    docker logs "$NET-masque-go" >"$W/masque-go-proxy.log" 2>&1 || true
+    docker rm -f "$NET-h3wire" "$NET-ngtcp2" "$NET-quiche" "$NET-h3wire-proxy" \
+        "$NET-masque-go" "$NET-udp-echo" >/dev/null 2>&1 || true
     docker network rm "$NET" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -58,7 +64,7 @@ trap cleanup EXIT
 run() { docker run --rm --network "$NET" --user "$U" -v "$W:/work" "$@"; }
 
 run "$PEERS" openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-    -days 7 -subj /CN=h3wire -addext "subjectAltName=DNS:h3wire,DNS:ngtcp2,DNS:quiche" \
+    -days 7 -subj /CN=h3wire -addext "subjectAltName=DNS:h3wire,DNS:ngtcp2,DNS:quiche,DNS:h3wire-proxy,DNS:masque-go" \
     -addext "basicConstraints=critical,CA:FALSE" -keyout /work/key.pem -out /work/cert.pem \
     2>/dev/null
 a() { head -c "$1" /dev/zero | tr '\0' a; }
@@ -70,13 +76,14 @@ SHA_1M=$(sha "$W/htdocs/bytes/1048576")
 SHA_8M=$(sha "$W/htdocs/bytes/8388608")
 HEX_POST=$(sha "$W/post.bin")
 
-# Start a server as `$NET-<name>`, reachable as <name>:4433, and wait for its socket.
+# Start a server as `$NET-<name>`, reachable as <name>:4433, and wait for its socket
+# (IPv4, or dual-stack IPv6 as Go opens for 0.0.0.0).
 serve() {
     local name=$1
     shift
     docker run -d --name "$NET-$name" --network "$NET" --network-alias "$name" --user "$U" \
         -v "$W:/work:ro" "$@" >/dev/null
-    timeout 30 sh -c "until docker exec $NET-$name grep -q ':1151 ' /proc/net/udp; do sleep 0.1; done"
+    timeout 30 sh -c "until docker exec $NET-$name grep -qs ':1151 ' /proc/net/udp /proc/net/udp6; do sleep 0.1; done"
 }
 serve h3wire "$OURS" h3wire-server --listen 0.0.0.0:4433 --cert /work/cert.pem \
     --key /work/key.pem --masque-echo
@@ -84,6 +91,15 @@ serve ngtcp2 "$PEERS" ngtcp2-server -q --send-trailers -d /work/htdocs 0.0.0.0 4
     /work/key.pem /work/cert.pem
 serve quiche "$PEERS" quiche-server --listen 0.0.0.0:4433 --cert /work/cert.pem \
     --key /work/key.pem --root /work/htdocs/
+MASQUE_PATH='/.well-known/masque/udp/{target_host}/{target_port}/'
+H3WIRE_PROXY_TEMPLATE=https://h3wire-proxy:4433$MASQUE_PATH
+MASQUE_GO_TEMPLATE=https://masque-go:4433$MASQUE_PATH
+serve h3wire-proxy "$OURS" h3wire-masque-proxy --listen 0.0.0.0:4433 --cert /work/cert.pem \
+    --key /work/key.pem --template "$H3WIRE_PROXY_TEMPLATE"
+serve masque-go "$PEERS" masque-go-proxy -b 0.0.0.0:4433 -c /work/cert.pem -k /work/key.pem \
+    -t "$MASQUE_GO_TEMPLATE"
+# One child per datagram, so payloads are echoed one by one, never coalesced.
+serve udp-echo "$PEERS" socat -T1 UDP4-RECVFROM:4433,fork PIPE
 
 server_log() { docker logs "$NET-h3wire" 2>&1; }
 
@@ -121,7 +137,8 @@ while IFS=$'\t' read -r cap peer version dir cmd status; do
         if run -e H3WIRE=https://h3wire:4433 -e NGTCP2=https://ngtcp2:4433 \
             -e QUICHE=https://quiche:4433 -e CA=/work/cert.pem -e POST=/work/post.bin \
             -e SHA_1M="$SHA_1M" -e SHA_8M="$SHA_8M" -e HEX_POST="$HEX_POST" \
-            -e OUT="/work/out/$id" "$image" timeout 60 sh -ec "$cmd" \
+            -e H3WIRE_PROXY_TEMPLATE="$H3WIRE_PROXY_TEMPLATE" \
+            -e MASQUE_GO_TEMPLATE="$MASQUE_GO_TEMPLATE" -e OUT="/work/out/$id" "$image" timeout 60 sh -ec "$cmd" \
             >"$W/out/$id.log" 2>&1 \
             && { [ "$dir" != "peer->h3wire" ] || closed_cleanly "$before" >>"$W/out/$id.log"; }; then
             result=pass

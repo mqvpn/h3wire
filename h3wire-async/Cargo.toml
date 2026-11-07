@@ -1,11 +1,11 @@
 [package]
 name = "h3wire-async"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Runtime-neutral async HTTP/3 over the sans-I/O h3wire core"
-repository = "https://github.com/mp0rta/h3wire"
+repository = "https://github.com/mqvpn/h3wire"
 documentation = "https://docs.rs/h3wire-async"
 readme = "README.md"
 keywords = ["http3", "quic", "async", "masque"]

@@ -18,7 +18,8 @@
 //! - a dropped `quinn::RecvStream` sends `STOP_SENDING(0)` only if it was neither read
 //!   to the end, reset by the peer, nor stopped.
 //!
-//! The API is unstable (0.x).
+//! h3wire-async is a stable candidate; 1.0 waits for a downstream user outside this
+//! workspace.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
