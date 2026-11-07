@@ -3,12 +3,16 @@
 #![no_main]
 
 use bytes::{Bytes, BytesMut};
-use h3wire_masque::capsule::{Decoder, Head, encode};
+use h3wire_masque::capsule::{CapsuleError, Decoder, Head, encode};
 use libfuzzer_sys::fuzz_target;
 
 /// Feed `bytes` in `chunk`-sized pieces. Each head is handled by `pick(head index)`:
 /// 0 take, 1 peek a varint then take, 2 skip. Returns the values taken whole.
-fn run(bytes: &[u8], chunk: usize, pick: impl Fn(usize) -> u8) -> (Vec<(u64, Bytes)>, bool) {
+fn run(
+    bytes: &[u8],
+    chunk: usize,
+    pick: impl Fn(usize) -> u8,
+) -> (Vec<(u64, Bytes)>, bool, Result<(), CapsuleError>) {
     let mut d = Decoder::default();
     let (mut cur, mut peeked, mut idx) = (None::<Head>, false, 0);
     let mut taken = Vec::new();
@@ -59,8 +63,8 @@ fn run(bytes: &[u8], chunk: usize, pick: impl Fn(usize) -> u8) -> (Vec<(u64, Byt
             }
         }
     }
-    let _ = d.finish();
-    (taken, failed)
+    // After an error the rest is never pushed, so `finish` then depends on the split.
+    (taken, failed, if failed { Ok(()) } else { d.finish() })
 }
 
 // Arbitrary bytes in arbitrary splits: no panic, the result must not depend on the
@@ -70,14 +74,14 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let pick = |i: usize| (i as u8).wrapping_add(k) % 3;
-    let (whole, failed) = run(bytes, bytes.len().max(1), pick);
-    let (split, failed2) = run(bytes, usize::from(k % 17).max(1), pick);
-    assert_eq!((&split, failed2), (&whole, failed));
+    let (whole, failed, fin) = run(bytes, bytes.len().max(1), pick);
+    let (split, failed2, fin2) = run(bytes, usize::from(k % 17).max(1), pick);
+    assert_eq!((&split, failed2, fin2), (&whole, failed, fin));
     let mut re = BytesMut::new();
     for (ty, v) in &whole {
         encode(*ty, v, &mut re).unwrap();
     }
-    let (again, failed) = run(&re, re.len().max(1), |_| 0);
+    let (again, failed, _) = run(&re, re.len().max(1), |_| 0);
     assert!(!failed);
     assert_eq!(again, whole);
 });

@@ -81,8 +81,10 @@ enum State {
 
 /// Incremental capsule decoder. Feed it with [`push`](Self::push); [`next`](Self::next)
 /// yields a [`Head`], then exactly one of [`take`](Self::take) or [`skip`](Self::skip)
-/// (optionally after [`peek_varint`](Self::peek_varint)) consumes the value. Non-minimal
-/// varints are accepted. Skipped values are never buffered.
+/// (optionally after [`peek_varint`](Self::peek_varint)) consumes the value; `next` drops
+/// any value left unfinished. Calling `peek_varint`, `take` or `skip` with no pending head
+/// is a driver bug (a `debug_assert!` fires). Non-minimal varints are accepted. Skipped
+/// values are never buffered.
 #[derive(Debug)]
 pub struct Decoder {
     chunks: VecDeque<Bytes>,
@@ -163,11 +165,17 @@ impl Decoder {
     }
 
     /// Consume one varint at the current position of the value; `None` means more bytes
-    /// are needed. `Malformed` if the value ends before the varint does.
+    /// are needed. `Malformed` if the value ends before the varint does. The decoder does
+    /// not remember the varint was consumed: a caller that can be cancelled between this
+    /// and `take` must keep its own "peeked" state.
     pub fn peek_varint(&mut self) -> Result<Option<u64>, CapsuleError> {
         let State::Value { remaining } = self.state else {
+            debug_assert!(false, "peek_varint with no pending head");
             return Ok(None);
         };
+        if remaining == 0 {
+            return Err(CapsuleError::Malformed);
+        }
         let mut b = [0u8; 8];
         let have = self.peek_into(&mut b);
         let Some(&first) = b[..have].first() else {
@@ -192,6 +200,7 @@ impl Decoder {
     /// the length alone, before anything is buffered.
     pub fn take(&mut self, max: usize) -> Result<Option<Bytes>, CapsuleError> {
         let State::Value { remaining } = self.state else {
+            debug_assert!(false, "take with no pending head");
             return Ok(None);
         };
         if remaining > max as u64 {
@@ -219,6 +228,7 @@ impl Decoder {
     /// `true` once the rest of the value has been dropped, without buffering it.
     pub fn skip(&mut self) -> Result<bool, CapsuleError> {
         let State::Value { remaining } = self.state else {
+            debug_assert!(false, "skip with no pending head");
             return Ok(false);
         };
         let n = remaining.min(self.buffered as u64);
@@ -237,7 +247,7 @@ impl Decoder {
     pub fn finish(&self) -> Result<(), CapsuleError> {
         match self.state {
             State::Head if self.buffered == 0 => Ok(()),
-            State::Value { remaining: 0 } => Ok(()),
+            State::Value { remaining: 0 } if self.buffered == 0 => Ok(()),
             _ => Err(CapsuleError::Truncated),
         }
     }
@@ -390,6 +400,11 @@ mod tests {
         d.next().unwrap();
         assert_eq!(d.skip(), Ok(true));
         assert_eq!(d.finish(), Ok(()));
+        // Truncation inside the next capsule's head, right after an empty value.
+        let mut d = Decoder::default();
+        d.push(Bytes::from_static(&[0x00, 0x00, 0x40]));
+        d.next().unwrap();
+        assert_eq!(d.finish(), Err(CapsuleError::Truncated));
     }
 
     #[test]
@@ -430,6 +445,22 @@ mod tests {
         // A value shorter than its varint.
         let mut d = Decoder::default();
         d.push(Bytes::from_static(&[0x00, 0x01, 0x40]));
+        d.next().unwrap();
+        assert_eq!(d.peek_varint(), Err(CapsuleError::Malformed));
+    }
+
+    #[test]
+    fn finish_with_partial_next_head_is_truncated() {
+        let mut d = Decoder::default();
+        d.push(Bytes::from_static(&[0x00, 0x00, 0x40]));
+        assert_eq!(d.next(), Ok(Some(Head { ty: 0, len: 0 })));
+        assert_eq!(d.finish(), Err(CapsuleError::Truncated));
+    }
+
+    #[test]
+    fn peek_varint_on_empty_value_is_malformed() {
+        let mut d = Decoder::default();
+        d.push(Bytes::from_static(&[0x00, 0x00]));
         d.next().unwrap();
         assert_eq!(d.peek_varint(), Err(CapsuleError::Malformed));
     }
