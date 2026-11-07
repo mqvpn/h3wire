@@ -68,6 +68,11 @@ jobs:
           cargo tree -p h3wire-async -e normal --no-default-features > tree.txt
           grep -q '^h3wire-async' tree.txt
           ! grep -q tokio tree.txt
+      # h3wire-masque stays runtime- and QUIC-stack-free.
+      - run: |
+          cargo tree -p h3wire-masque -e normal --prefix none > tree.txt
+          grep -q '^h3wire-masque' tree.txt
+          if grep -q -e tokio -e quinn tree.txt; then exit 1; fi
 
   msrv:
     if: github.event_name != 'schedule'
@@ -79,6 +84,7 @@ jobs:
       - run: cargo build -p h3wire-async --features tokio --locked
       # Build-only: h3wire-quinn's dev-dep tree (time >= 0.3.47) needs a newer rustc.
       - run: cargo build -p h3wire-quinn --locked
+      - run: cargo build -p h3wire-masque --locked
 
   deny:
     if: github.event_name != 'schedule'
