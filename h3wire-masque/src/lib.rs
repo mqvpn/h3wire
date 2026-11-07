@@ -6,3 +6,6 @@
 
 pub mod capsule;
 pub mod template;
+pub mod tunnel;
+
+pub use tunnel::{Carrier, MAX_UDP_PAYLOAD, UdpError, UdpReceiver, UdpSender, UdpTunnel};

@@ -392,11 +392,19 @@ name = "h3wire-masque"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures",
  "futures-core",
  "h3wire-async",
+ "h3wire-quinn",
  "http",
  "http-body",
+ "http-body-util",
  "proptest",
+ "quinn",
+ "rcgen",
+ "sha2",
+ "tokio",
+ "tower-service",
 ]
 
 [[package]]

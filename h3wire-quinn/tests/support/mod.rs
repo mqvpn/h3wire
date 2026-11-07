@@ -44,21 +44,35 @@ pub fn endpoint_pair() -> (Endpoint, Endpoint, SocketAddr) {
 pub fn endpoint_pair_with(
     f: impl FnOnce(&mut quinn::TransportConfig),
 ) -> (Endpoint, Endpoint, SocketAddr) {
+    let mut t = transport();
+    f(&mut t);
+    let t = Arc::new(t);
+    endpoint_pair_split(t.clone(), t)
+}
+
+/// The default test transport config: datagrams enabled.
+pub fn transport() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.datagram_receive_buffer_size(Some(1 << 16));
+    transport
+}
+
+/// [`endpoint_pair`] with a transport config per endpoint.
+pub fn endpoint_pair_split(
+    server_transport: Arc<quinn::TransportConfig>,
+    client_transport: Arc<quinn::TransportConfig>,
+) -> (Endpoint, Endpoint, SocketAddr) {
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert: CertificateDer<'static> = ck.cert.der().clone();
     let key = PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der());
-    let mut transport = quinn::TransportConfig::default();
-    transport.datagram_receive_buffer_size(Some(1 << 16));
-    f(&mut transport);
-    let transport = Arc::new(transport);
     let mut sc = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key.into()).unwrap();
-    sc.transport_config(transport.clone());
+    sc.transport_config(server_transport);
     let server = Endpoint::server(sc, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     let addr = server.local_addr().unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(cert).unwrap();
     let mut cc = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
-    cc.transport_config(transport);
+    cc.transport_config(client_transport);
     let mut client = Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     client.set_default_client_config(cc);
     (server, client, addr)
@@ -77,7 +91,18 @@ pub async fn connect() -> Conns {
 
 /// [`connect`], with `f` applied to the transport config.
 pub async fn connect_with(f: impl FnOnce(&mut quinn::TransportConfig)) -> Conns {
-    let (se, ce, addr) = endpoint_pair_with(f);
+    connect_endpoints(endpoint_pair_with(f)).await
+}
+
+/// [`connect`] over [`endpoint_pair_split`].
+pub async fn connect_split(
+    server_transport: Arc<quinn::TransportConfig>,
+    client_transport: Arc<quinn::TransportConfig>,
+) -> Conns {
+    connect_endpoints(endpoint_pair_split(server_transport, client_transport)).await
+}
+
+async fn connect_endpoints((se, ce, addr): (Endpoint, Endpoint, SocketAddr)) -> Conns {
     let (server, client) =
         tokio::join!(async { se.accept().await.unwrap().await.unwrap() }, async {
             ce.connect(addr, "localhost").unwrap().await.unwrap()
@@ -329,8 +354,20 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
+    pair_builders(conns, sb, &Builder::new(), service).await
+}
+
+/// [`pair_with`], the client built by `cb`.
+pub async fn pair_builders<S>(conns: Conns, sb: &Builder, cb: &Builder, service: S) -> Pair
+where
+    S: Service<Request<RecvBody>, Response = Response<BoxBody>, Error = BoxError>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
     let server = spawn_server(conns.server.clone(), sb, service);
-    let (send, conn) = h3wire_quinn::client(conns.client.clone(), &Builder::new(), TokioExecutor)
+    let (send, conn) = h3wire_quinn::client(conns.client.clone(), cb, TokioExecutor)
         .await
         .unwrap();
     Pair {
