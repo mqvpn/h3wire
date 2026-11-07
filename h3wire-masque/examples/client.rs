@@ -16,6 +16,7 @@
 //! gracefully before exit.
 //!
 //! Library crates select no TLS provider; this example uses rustls with ring.
+#![forbid(unsafe_code)]
 
 use bytes::Bytes;
 use h3wire_async::rt::TokioExecutor;

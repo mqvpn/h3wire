@@ -7,7 +7,7 @@ sans-I/O [h3wire](https://crates.io/crates/h3wire) core.
 This crate selects no runtime, TLS provider or certificate verifier: configure your own
 quinn endpoint (ALPN `h3`) and hand its connections over.
 
-> **Note:** h3wire-async's API is unstable until the v0.3 MASQUE milestone: expect 0.x minor bumps; patches never break.
+> **Note:** h3wire-async is a stable candidate; 1.0 waits for a downstream user outside this workspace.
 
 ## Usage
 

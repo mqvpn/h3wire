@@ -112,7 +112,7 @@ Unsupported by peer tooling:
      rejects `:protocol`; `--dgram-proto` sends datagrams without Extended CONNECT);
    - curl 8.21+ speaks CONNECT-UDP only as the client of an HTTP/3 proxy
      (`--proxy-http3`, experimental, needs a `USE_PROXY_HTTP3` build). That needs a proxy
-     that forwards to a target, and our server only echoes.
+     that forwards to a target, which the echo server is not.
 
    MASQUE interop is against masque-go, in [MASQUE](#masque). The echo route itself
    was checked locally
