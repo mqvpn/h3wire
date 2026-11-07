@@ -130,8 +130,8 @@ pub(crate) enum Up {
     Active,
     /// The tunnel was taken; kept until the entry is reaped.
     Tunnel,
-    /// Server: the final response settled a claim without a tunnel; its `OnUpgrade`
-    /// resolves to this.
+    /// The claim ended without a tunnel (a non-2xx or failed response, or an
+    /// `OnUpgrade::abort`); its `OnUpgrade` resolves to this.
     Failed(Error),
 }
 
@@ -461,14 +461,15 @@ impl Inner {
     /// the stream had no terminal event yet; after `Finished` (the peer's FIN was read) it
     /// emits nothing, so a send side still open is ended here with
     /// `StreamAborted { code, Local }` (and likewise a receive side not ended yet).
-    /// Wakes the driver for the core's actions.
-    pub(crate) fn abort_local(&mut self, id: StreamId, code: H3Code) {
-        // Err: the connection is closed, the stream unknown or the code refused.
+    /// Wakes the driver for the core's actions. `false`: the core refused (connection
+    /// closed, stream unknown or code refused) and nothing changed.
+    pub(crate) fn abort_local(&mut self, id: StreamId, code: H3Code) -> bool {
         if self.conn.abort(id, code).is_err() {
-            return;
+            return false;
         }
         crate::driver::dispatch_events(self);
         self.record_abort(id, code);
+        true
     }
 
     /// After a successful local `conn.abort(id, code)`: end, as `StreamAborted { code,

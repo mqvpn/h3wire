@@ -948,3 +948,22 @@ fn on_upgrade_abort_wakes_pending_claim() {
     });
     drop(net);
 }
+
+/// A code the core refuses (`H3_REQUEST_REJECTED` on a delivered request) makes `abort` a
+/// no-op: the 200 that follows still opens the tunnel.
+#[test]
+fn on_upgrade_abort_refused_code_is_noop() {
+    let mut p = plain();
+    let exec = p.exec.clone();
+    run(&exec, async {
+        let (resp, (mut req, tx)) = request(&mut p, connect()).await;
+        let on = upgrade::on(&mut req);
+        drop(req);
+        on.abort(H3Code::REQUEST_REJECTED);
+        tx.send(reply(200, "")).unwrap();
+        let mut resp = out(&resp).await.expect("a response");
+        let _client = upgrade::on(&mut resp).await.expect("client tunnel");
+        on.await.expect("server tunnel");
+    });
+    assert!(!aborted_any(&p.net, S0), "{:?}", p.net.trace());
+}

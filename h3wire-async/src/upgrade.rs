@@ -146,11 +146,15 @@ pub struct OnUpgrade {
 impl OnUpgrade {
     /// Abort the whole request with `code`, e.g. to reject a CONNECT before any response;
     /// idempotent. This future then resolves to `StreamAborted { code, Local }`, and a
-    /// response returned afterwards is discarded. Does nothing without a claim.
+    /// response returned afterwards is discarded. Does nothing without a claim, or when the
+    /// core refuses the abort (a closed connection, a code it forbids such as
+    /// `H3_REQUEST_REJECTED` on a delivered request, or one above 2^62 - 1).
     pub fn abort(&self, code: H3Code) {
         let Some(c) = &self.claim else { return };
         c.shared.with(|i| {
-            i.abort_local(c.id, code);
+            if !i.abort_local(c.id, code) {
+                return;
+            }
             let Some(st) = i.streams.get_mut(&c.id) else {
                 return;
             };
@@ -304,7 +308,9 @@ impl Tunnel {
 /// Abort the whole request with `code`; idempotent. It is recorded at once, so the other
 /// half sees `StreamAborted { code, source: Local }` immediately.
 fn abort(shared: &Shared, id: StreamId, code: H3Code) {
-    shared.with(|i| i.abort_local(id, code));
+    shared.with(|i| {
+        i.abort_local(id, code);
+    });
 }
 
 /// The sending half of a [`Tunnel`].
