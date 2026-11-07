@@ -91,16 +91,20 @@ impl Pending {
 
     /// The tunnel, once the 2xx has been sent and the peer's SETTINGS arrived. Spawn or
     /// await it **after** the service returned the response; awaiting it inside the
-    /// service deadlocks. A non-2xx response resolves it to `NotUpgraded`.
+    /// service deadlocks. A non-2xx response resolves it to `NotUpgraded`. A request
+    /// reset before the SETTINGS resolves it to that error; a FIN (or a lot of tunnel
+    /// data) before them gives a capsule-carrier tunnel.
     #[allow(clippy::manual_async_fn)] // the signature promises `Send`
     pub fn tunnel(self) -> impl Future<Output = Result<UdpTunnel, Error>> + Send {
         async move {
             let tunnel = self.on.await?;
-            let settings_ok = match &self.info {
-                Some(i) => i.settings().await.is_some(),
-                None => false,
+            let settings = async {
+                match &self.info {
+                    Some(i) => i.settings().await.is_some(),
+                    None => false,
+                }
             };
-            Ok(UdpTunnel::new(tunnel, self.dgrams, settings_ok))
+            UdpTunnel::open(tunnel, self.dgrams, settings).await
         }
     }
 }

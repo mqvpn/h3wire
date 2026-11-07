@@ -96,8 +96,10 @@ where
         .get::<DatagramSlot>()
         .and_then(DatagramSlot::register);
     let tunnel = on.await.map_err(ConnectError::Http)?;
-    let settings_ok = send.settings().await.is_some();
-    Ok(UdpTunnel::new(tunnel, dgrams, settings_ok))
+    let settings = async { send.settings().await.is_some() };
+    UdpTunnel::open(tunnel, dgrams, settings)
+        .await
+        .map_err(ConnectError::Http)
 }
 
 /// A 2xx that cannot start a capsule-protocol tunnel (RFC 9297 section 3.2, RFC 9114

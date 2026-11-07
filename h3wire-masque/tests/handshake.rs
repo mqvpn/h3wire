@@ -435,3 +435,61 @@ async fn server_without_slot_capsule_only() {
     })
     .await
 }
+
+/// A client that withholds its SETTINGS cannot park `Pending::tunnel`: a reset of the
+/// request ends the wait with the reset, and a FIN ends it on the capsule carrier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_wait_for_settings_ends_with_the_stream() {
+    with_timeout(async {
+        let conns = conns().await;
+        let (svc, mut reqs) = handoff();
+        let _server = spawn_server(conns.server.clone(), &server_builder(), svc);
+        let mut cfg = Config::default();
+        cfg.h3_datagram = true;
+        let mut peer = CorePeer::new(
+            Role::Client,
+            cfg,
+            QuinnConnection::new(conns.client.clone()),
+        );
+        peer.defer_control(true);
+        peer.run_until(|p| p.core().peer_settings().is_some()).await;
+        let path = "/.well-known/masque/udp/192.0.2.1/443/";
+        let fields = [
+            (":method", "CONNECT"),
+            (":protocol", "connect-udp"),
+            (":scheme", "https"),
+            (":authority", "localhost"),
+            (":path", path),
+            ("capsule-protocol", "?1"),
+        ];
+        for reset in [true, false] {
+            let s = peer.open_bidi().await.unwrap();
+            peer.send_headers(s, &fields, false).unwrap();
+            let (mut req, tx) = drive(&mut peer, reqs.recv()).await.unwrap();
+            let pending = accept(&mut req, &template()).unwrap();
+            tx.send(pending.response()).unwrap();
+            let t = tokio::spawn(pending.tunnel());
+            peer.run_until(|p| statuses(p, s) == ["200"]).await;
+            if reset {
+                peer.reset(s, H3Code::INTERNAL_ERROR);
+            } else {
+                peer.send_body(s, &cap(&ctx0(b"early")), true);
+            }
+            let r = drive(&mut peer, tokio::time::timeout(Duration::from_secs(2), t)).await;
+            let r = r.expect("the tunnel kept waiting for SETTINGS").unwrap();
+            if reset {
+                let e = r.unwrap_err();
+                assert!(
+                    aborted(&e, H3Code::INTERNAL_ERROR, AbortSource::Peer),
+                    "{e:?}"
+                );
+            } else {
+                let mut u = r.unwrap();
+                assert_eq!(u.carrier(), Carrier::Capsule);
+                assert_eq!(u.recv().await.unwrap().unwrap(), "early");
+                assert_eq!(u.recv().await.unwrap(), None);
+            }
+        }
+    })
+    .await
+}

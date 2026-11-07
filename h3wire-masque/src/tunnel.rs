@@ -29,6 +29,10 @@ use std::task::{Context, Poll};
 /// Progress steps per carrier in one `recv` poll before yielding.
 const MAX_STEPS: usize = 32;
 
+/// Stream bytes a tunnel buffers while it waits for the peer's SETTINGS; past this it
+/// stops waiting and carries capsules.
+const SETTINGS_WAIT_BYTES: usize = 64 * 1024;
+
 /// The largest UDP payload a context-ID-0 tunnel carries (RFC 9298 section 5).
 pub const MAX_UDP_PAYLOAD: usize = 65_527;
 
@@ -90,15 +94,40 @@ pub struct UdpTunnel {
 }
 
 impl UdpTunnel {
-    /// `settings_ok`: the peer's SETTINGS have arrived.
-    pub(crate) fn new(tunnel: Tunnel, dgrams: Option<Datagrams>, settings_ok: bool) -> Self {
-        let (tx, rx) = tunnel.split();
+    /// Wait for `settings` (`true`: the peer's SETTINGS arrived) to choose the carrier.
+    /// The stream is read meanwhile, so the wait cannot outlive the request: its bytes go
+    /// to the capsule decoder, a reset or error is returned, and a FIN or more than
+    /// [`SETTINGS_WAIT_BYTES`] received settles without SETTINGS (capsule carrier).
+    pub(crate) async fn open(
+        tunnel: Tunnel,
+        dgrams: Option<Datagrams>,
+        settings: impl Future<Output = bool>,
+    ) -> Result<Self, Error> {
+        let (tx, mut rx) = tunnel.split();
+        let mut capsules = Capsules::default();
+        let mut eof = false;
+        let mut settings = pin!(settings);
+        let settings_ok = poll_fn(|cx| {
+            if let Poll::Ready(ok) = settings.as_mut().poll(cx) {
+                return Poll::Ready(Ok(ok));
+            }
+            while !eof && capsules.dec.buffered() <= SETTINGS_WAIT_BYTES {
+                match pin!(rx.recv()).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(Some(b))) => capsules.dec.push(b),
+                    Poll::Ready(Ok(None)) => eof = true,
+                }
+            }
+            Poll::Ready(Ok(false))
+        })
+        .await?;
         let (dtx, drx) = match dgrams.map(Datagrams::split) {
             Some((s, r)) => (Some(s), Some(r)),
             None => (None, None),
         };
         let dtx = dtx.filter(|d| settings_ok && d.max_payload().is_some());
-        UdpTunnel {
+        Ok(UdpTunnel {
             send: UdpSender {
                 tunnel: tx,
                 dgrams: dtx,
@@ -107,12 +136,12 @@ impl UdpTunnel {
             recv: UdpReceiver {
                 tunnel: rx,
                 dgrams: drx,
-                capsules: Capsules::default(),
+                capsules,
                 dgram_first: false,
-                eof: false,
+                eof,
                 end: None,
             },
-        }
+        })
     }
 
     /// See [`UdpSender::send`].
