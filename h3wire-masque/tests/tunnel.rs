@@ -1,139 +1,31 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 mp0rta
-//! `UdpTunnel` over h3wire-quinn loopback (spec §2.4). The CONNECT-UDP exchange is built
-//! by hand with h3wire-async; a raw `Tunnel`/`Datagrams` plays the peer where the test
-//! needs control over the wire.
+//! `UdpTunnel` over h3wire-quinn loopback (spec §2.4), set up with `client::connect` and
+//! `server::accept`; a raw `Tunnel`/`Datagrams` plays the peer where the test needs
+//! control over the wire.
 
 mod support;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::poll;
+use h3wire_async::Builder;
+use h3wire_async::DatagramError;
 use h3wire_async::core::{AbortSource, H3Code};
-use h3wire_async::datagram::{DatagramSlot, Datagrams, RegisterDatagrams};
-use h3wire_async::ext::{ConnInfo, Protocol};
-use h3wire_async::upgrade::{self, Tunnel};
-use h3wire_async::{Builder, DatagramError, Error, ErrorKind};
-use h3wire_masque::capsule::{self, DATAGRAM};
+use h3wire_async::datagram::DatagramSlot;
 use h3wire_masque::{Carrier, MAX_UDP_PAYLOAD, UdpError, UdpTunnel};
-use http::{Method, Request};
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 use support::*;
-use tokio::sync::mpsc;
 
 const MSG: H3Code = H3Code::MESSAGE_ERROR;
 const RC: H3Code = H3Code::REQUEST_CANCELLED;
 
-type Reqs = mpsc::UnboundedReceiver<Handed>;
-
-fn aborted(e: &Error, code: H3Code, source: AbortSource) -> bool {
-    matches!(e.kind(), ErrorKind::StreamAborted { code: c, source: s, .. } if *c == code && *s == source)
-}
-
-fn udp_aborted(e: &UdpError, code: H3Code, source: AbortSource) -> bool {
-    matches!(e, UdpError::Http(e) if aborted(e, code, source))
-}
-
-/// Loopback endpoints with a fixed path MTU (no PMTU discovery): a stable datagram limit.
-async fn conns() -> Conns {
-    connect_with(|t| {
-        t.mtu_discovery_config(None);
-    })
-    .await
-}
-
-/// A transport config with or without QUIC datagrams.
-fn transport_with(dgrams: bool) -> Arc<quinn::TransportConfig> {
-    let mut t = transport();
-    if !dgrams {
-        t.datagram_receive_buffer_size(None);
-    }
-    Arc::new(t)
-}
-
-fn server_builder() -> Builder {
-    let mut b = Builder::new();
-    b.enable_connect_protocol(true);
-    b
-}
-
-async fn masque_over(conns: Conns, cb: &Builder) -> (Pair, Reqs) {
-    let (svc, reqs) = handoff();
-    (pair_builders(conns, &server_builder(), cb, svc).await, reqs)
-}
-
-async fn masque() -> (Pair, Reqs) {
-    masque_over(conns().await, &Builder::new()).await
-}
-
-/// A CONNECT-UDP request to `192.0.2.1:443`, registering HTTP datagrams.
-fn connect_udp() -> Request<BoxBody> {
-    let mut r = Request::builder()
-        .method(Method::CONNECT)
-        .uri("https://localhost/.well-known/masque/udp/192.0.2.1/443/")
-        .header("capsule-protocol", "?1")
-        .body(empty())
-        .unwrap();
-    r.extensions_mut()
-        .insert(Protocol::from_static("connect-udp"));
-    r.extensions_mut().insert(RegisterDatagrams);
-    r
-}
-
-/// The raw ends of one CONNECT-UDP accepted with 200, after both SETTINGS.
-struct Ends {
-    ct: Tunnel,
-    cd: Option<Datagrams>,
-    st: Tunnel,
-    sd: Option<Datagrams>,
-}
-
-async fn open(p: &mut Pair, reqs: &mut Reqs) -> Ends {
-    let resp = tokio::spawn(p.send.send_request(connect_udp()));
-    let (mut req, reply) = reqs.recv().await.unwrap();
-    let sd = req
-        .extensions()
-        .get::<DatagramSlot>()
-        .and_then(|s| s.register());
-    let on = upgrade::on(&mut req);
-    let info = req.extensions().get::<ConnInfo>().unwrap().clone();
-    reply.send(support::reply(200, empty())).unwrap();
-    let mut resp = resp.await.unwrap().unwrap();
-    assert_eq!(resp.status(), 200);
-    let cd = resp
-        .extensions()
-        .get::<DatagramSlot>()
-        .and_then(|s| s.register());
-    let ct = upgrade::on(&mut resp).await.unwrap();
-    let st = on.await.unwrap();
-    info.settings().await.unwrap();
-    p.send.settings().await.unwrap();
-    Ends { ct, cd, st, sd }
-}
-
-fn udp(t: Tunnel, d: Option<Datagrams>) -> UdpTunnel {
-    UdpTunnel::__from_parts(t, d, true)
-}
-
-/// Client and server `UdpTunnel`s of one CONNECT-UDP.
-async fn udp_pair(p: &mut Pair, reqs: &mut Reqs) -> (UdpTunnel, UdpTunnel) {
-    let Ends { ct, cd, st, sd } = open(p, reqs).await;
-    (udp(ct, cd), udp(st, sd))
-}
-
-/// A DATAGRAM capsule with this raw value.
-fn cap(value: &[u8]) -> Bytes {
-    let mut out = BytesMut::new();
-    capsule::encode(DATAGRAM, value, &mut out).unwrap();
-    out.freeze()
-}
-
-/// A context-ID-0 UDP payload, as a datagram payload or a capsule value.
-fn ctx0(payload: &[u8]) -> Bytes {
-    [&[0][..], payload].concat().into()
+/// A pair whose transports have no datagrams: every tunnel carries capsules.
+async fn capsule_masque() -> (Pair, Reqs) {
+    masque_over(conns_no_datagrams().await, &Builder::new()).await
 }
 
 /// An 8-byte (non-minimal) encoding of context ID 0.
@@ -183,19 +75,14 @@ async fn datagram_carrier_round_trip() {
         assert_eq!(c.recv().await.unwrap(), None);
 
         // On the wire: a one-byte context ID 0, then the payload.
-        let Ends {
-            ct,
-            cd,
-            st: _st,
-            sd,
-        } = open(&mut p, &mut reqs).await;
-        let (mut c, mut sd) = (udp(ct, cd), sd.unwrap());
+        let (mut c, _st, sd) = raw_server(&mut p, &mut reqs).await;
+        let mut sd = sd.unwrap();
         c.send(Bytes::from_static(b"wire")).await.unwrap();
         assert_eq!(sd.recv().await.unwrap().unwrap(), ctx0(b"wire"));
 
         // Empty and maximum payloads over the capsule carrier (datagrams are MTU-bound).
-        let Ends { ct, st, .. } = open(&mut p, &mut reqs).await;
-        let (mut c, mut s) = (udp(ct, None), udp(st, None));
+        let (mut p, mut reqs) = capsule_masque().await;
+        let (mut c, mut s) = udp_pair(&mut p, &mut reqs).await;
         assert_eq!(
             (c.carrier(), s.carrier()),
             (Carrier::Capsule, Carrier::Capsule)
@@ -210,10 +97,12 @@ async fn datagram_carrier_round_trip() {
 /// advertised `H3_DATAGRAM` (it has a slot then).
 async fn capsule_carrier(server_dgrams: bool, client_dgrams: bool, sd: bool) {
     let conns = connect_split(transport_with(server_dgrams), transport_with(client_dgrams)).await;
-    let (mut p, mut reqs) = masque_over(conns, &Builder::new()).await;
-    let e = open(&mut p, &mut reqs).await;
-    assert_eq!(e.sd.is_some(), sd);
-    let (mut c, mut s) = (udp(e.ct, e.cd), udp(e.st, e.sd));
+    let (p, mut reqs) = masque_over(conns, &Builder::new()).await;
+    let c = spawn_connect(&p);
+    let (req, reply) = reqs.recv().await.unwrap();
+    assert_eq!(req.extensions().get::<DatagramSlot>().is_some(), sd);
+    let mut s = serve(req, reply).await;
+    let mut c = c.await.unwrap().unwrap();
     assert_eq!(
         (c.carrier(), s.carrier()),
         (Carrier::Capsule, Carrier::Capsule)
@@ -247,8 +136,8 @@ async fn capsule_carrier_both_disabled() {
 async fn mixed_carriers_on_receive() {
     with_timeout(async {
         let (mut p, mut reqs) = masque().await;
-        let Ends { mut ct, cd, st, sd } = open(&mut p, &mut reqs).await;
-        let (cd, mut s) = (cd.unwrap(), udp(st, sd));
+        let RawClient { mut ct, cd, mut s } = raw_client(&mut p, &mut reqs).await;
+        let cd = cd.unwrap();
         assert_eq!(s.carrier(), Carrier::Datagram);
         cd.send(ctx0(b"d1")).unwrap();
         ct.send(cap(&ctx0(b"c1"))).await.unwrap();
@@ -263,8 +152,8 @@ async fn mixed_carriers_on_receive() {
 async fn nonzero_context_dropped() {
     with_timeout(async {
         let (mut p, mut reqs) = masque().await;
-        let Ends { mut ct, cd, st, sd } = open(&mut p, &mut reqs).await;
-        let (cd, mut s) = (cd.unwrap(), udp(st, sd));
+        let RawClient { mut ct, cd, mut s } = raw_client(&mut p, &mut reqs).await;
+        let cd = cd.unwrap();
         // Context IDs 2 and 100 (a two-byte varint), both carriers.
         cd.send(Bytes::from_static(b"\x02x")).unwrap();
         cd.send(Bytes::from_static(b"\x40\x64y")).unwrap();
@@ -284,13 +173,11 @@ async fn nonzero_context_dropped() {
 async fn nonzero_context_capsule_skipped_unbuffered() {
     with_timeout(async {
         let (mut p, mut reqs) = masque().await;
-        let Ends {
+        let RawClient {
             mut ct,
             cd: _cd,
-            st,
-            sd,
-        } = open(&mut p, &mut reqs).await;
-        let mut s = udp(st, sd);
+            mut s,
+        } = raw_client(&mut p, &mut reqs).await;
         // 1 MiB under context ID 100: skipped, whatever its size (the decoder unit test
         // shows nothing of it is buffered).
         let big = [&b"\x40\x64"[..], &pattern(1 << 20)].concat();
@@ -305,8 +192,8 @@ async fn nonzero_context_capsule_skipped_unbuffered() {
 async fn non_minimal_context_id_stripped() {
     with_timeout(async {
         let (mut p, mut reqs) = masque().await;
-        let Ends { mut ct, cd, st, sd } = open(&mut p, &mut reqs).await;
-        let (cd, mut s) = (cd.unwrap(), udp(st, sd));
+        let RawClient { mut ct, cd, mut s } = raw_client(&mut p, &mut reqs).await;
+        let cd = cd.unwrap();
         cd.send([&ZERO8[..], b"d8"].concat().into()).unwrap();
         cd.send(Bytes::from_static(b"\x40\x00d2")).unwrap();
         ct.send(cap(&[&ZERO8[..], b"c8"].concat())).await.unwrap();
@@ -326,30 +213,26 @@ async fn oversized_payload() {
     with_timeout(async {
         let (mut p, mut reqs) = masque().await;
         let over = Bytes::from(vec![1; MAX_UDP_PAYLOAD + 1]);
-        let Ends {
-            ct, cd, st: _st, ..
-        } = open(&mut p, &mut reqs).await;
-        let mut c = udp(ct, cd);
+        let (mut c, _s) = udp_pair(&mut p, &mut reqs).await;
         assert_eq!(c.carrier(), Carrier::Datagram);
         assert!(matches!(
             c.send(over.clone()).await,
             Err(UdpError::TooLarge)
         ));
-        let Ends { ct, st: _st, .. } = open(&mut p, &mut reqs).await;
-        let mut c = udp(ct, None);
+        let (mut cp, mut creqs) = capsule_masque().await;
+        let (mut c, _s) = udp_pair(&mut cp, &mut creqs).await;
+        assert_eq!(c.carrier(), Carrier::Capsule);
         assert!(matches!(
             c.send(over.clone()).await,
             Err(UdpError::TooLarge)
         ));
 
         // A peer's 65,528-byte context-0 payload aborts the stream.
-        let Ends {
+        let RawClient {
             mut ct,
             cd: _cd,
-            st,
-            sd,
-        } = open(&mut p, &mut reqs).await;
-        let mut s = udp(st, sd);
+            mut s,
+        } = raw_client(&mut p, &mut reqs).await;
         ct.send(cap(&ctx0(&over))).await.unwrap();
         let e = s.recv().await.unwrap_err();
         assert!(udp_aborted(&e, MSG, AbortSource::Local), "{e:?}");
@@ -366,13 +249,11 @@ async fn malformed_and_truncated_capsule_abort() {
         // A value ending inside its context ID; an empty value; FIN inside a capsule.
         let cut = cap(&ctx0(b"cut")).slice(..4);
         for (wire, fin) in [(cap(b"\x40"), false), (cap(b""), false), (cut, true)] {
-            let Ends {
+            let RawClient {
                 mut ct,
                 cd: _cd,
-                st,
-                sd,
-            } = open(&mut p, &mut reqs).await;
-            let mut s = udp(st, sd);
+                mut s,
+            } = raw_client(&mut p, &mut reqs).await;
             ct.send(wire).await.unwrap();
             if fin {
                 ct.finish().unwrap();
@@ -395,13 +276,11 @@ async fn eof_needs_tunnel_fin_and_clean_decoder() {
         let (mut p, mut reqs) = masque().await;
         // At FIN the datagram handle ends (`Ok(None)`) while capsules are still
         // buffered: they all arrive, then `recv` ends, and stays ended.
-        let Ends {
+        let RawClient {
             mut ct,
             cd: _cd,
-            st,
-            sd,
-        } = open(&mut p, &mut reqs).await;
-        let mut s = udp(st, sd);
+            mut s,
+        } = raw_client(&mut p, &mut reqs).await;
         let mut wire = Vec::new();
         for i in 0..50u8 {
             wire.extend_from_slice(&cap(&ctx0(&[i])));
@@ -416,13 +295,11 @@ async fn eof_needs_tunnel_fin_and_clean_decoder() {
         assert_eq!(s.recv().await.unwrap(), None);
 
         // FIN inside a capsule: what came before arrives, then the abort.
-        let Ends {
+        let RawClient {
             mut ct,
             cd: _cd,
-            st,
-            sd,
-        } = open(&mut p, &mut reqs).await;
-        let mut s = udp(st, sd);
+            mut s,
+        } = raw_client(&mut p, &mut reqs).await;
         let wire = [&cap(&ctx0(b"whole"))[..], &cap(&ctx0(b"cut"))[..4]].concat();
         ct.send(wire.into()).await.unwrap();
         ct.finish().unwrap();
@@ -439,8 +316,8 @@ async fn eof_needs_tunnel_fin_and_clean_decoder() {
 async fn recv_alternates_under_datagram_flood() {
     with_timeout(async {
         let (mut p, mut reqs) = masque().await;
-        let Ends { mut ct, cd, st, sd } = open(&mut p, &mut reqs).await;
-        let (cd, mut s) = (cd.unwrap(), udp(st, sd));
+        let RawClient { mut ct, cd, mut s } = raw_client(&mut p, &mut reqs).await;
+        let cd = cd.unwrap();
         // Ten capsules are buffered at the server, then a datagram flood fills its queue.
         for i in 0..10u8 {
             ct.send(cap(&ctx0(&[b'c', i]))).await.unwrap();
@@ -487,13 +364,11 @@ async fn recv_alternates_under_datagram_flood() {
 async fn recv_cancel_mid_capsule_keeps_state() {
     with_timeout(async {
         let (mut p, mut reqs) = masque().await;
-        let Ends {
+        let RawClient {
             mut ct,
             cd: _cd,
-            st,
-            sd,
-        } = open(&mut p, &mut reqs).await;
-        let mut s = udp(st, sd);
+            mut s,
+        } = raw_client(&mut p, &mut reqs).await;
         // Head, context ID and two payload bytes: the ID is consumed before the cancel.
         let whole = cap(&ctx0(b"hello, world"));
         ct.send(whole.slice(..5)).await.unwrap();
@@ -518,9 +393,9 @@ async fn send_cancel_writes_nothing() {
         // Admission only into an empty send queue; the server does not read yet.
         let mut cb = Builder::new();
         cb.send_capacity(1);
-        let (mut p, mut reqs) = masque_over(conns().await, &cb).await;
-        let Ends { ct, st, .. } = open(&mut p, &mut reqs).await;
-        let (mut c, mut s) = (udp(ct, None), udp(st, None));
+        let (mut p, mut reqs) = masque_over(conns_no_datagrams().await, &cb).await;
+        let (mut c, mut s) = udp_pair(&mut p, &mut reqs).await;
+        assert_eq!(c.carrier(), Carrier::Capsule);
         let msg = |i: u32| {
             let mut v = pattern(60_000).to_vec();
             v[..4].copy_from_slice(&i.to_be_bytes());
@@ -564,8 +439,8 @@ async fn send_cancel_writes_nothing() {
 async fn datagram_too_large_not_resent_as_capsule() {
     with_timeout(async {
         let (mut p, mut reqs) = masque().await;
-        let Ends { ct, cd, mut st, sd } = open(&mut p, &mut reqs).await;
-        let (mut c, mut sd) = (udp(ct, cd), sd.unwrap());
+        let (mut c, mut st, sd) = raw_server(&mut p, &mut reqs).await;
+        let mut sd = sd.unwrap();
         let n = c.max_payload().unwrap();
         assert!(matches!(
             c.send(Bytes::from(vec![7; n + 1])).await,
@@ -585,24 +460,14 @@ async fn split_half_drop_aborts() {
     with_timeout(async {
         let (mut p, mut reqs) = masque().await;
         // The sender dropped before `finish`.
-        let Ends {
-            ct,
-            cd,
-            mut st,
-            sd: _sd,
-        } = open(&mut p, &mut reqs).await;
-        let (tx, _rx) = udp(ct, cd).split();
+        let (c, mut st, _sd) = raw_server(&mut p, &mut reqs).await;
+        let (tx, _rx) = c.split();
         drop(tx);
         let e = read_to_end(&mut st).await.unwrap_err();
         assert!(aborted(&e, RC, AbortSource::Peer), "{e:?}");
         // The receiver dropped before EOF.
-        let Ends {
-            ct,
-            cd,
-            mut st,
-            sd: _sd,
-        } = open(&mut p, &mut reqs).await;
-        let (mut tx, rx) = udp(ct, cd).split();
+        let (c, mut st, _sd) = raw_server(&mut p, &mut reqs).await;
+        let (mut tx, rx) = c.split();
         drop(rx);
         let e = read_to_end(&mut st).await.unwrap_err();
         assert!(aborted(&e, RC, AbortSource::Peer), "{e:?}");
@@ -630,8 +495,9 @@ async fn max_payload_values() {
         let limit = |q: &quinn::Connection| q.max_datagram_size().unwrap() - 2;
         assert_eq!(c.max_payload(), Some(limit(&p.conns.client)));
         assert_eq!(s.max_payload(), Some(limit(&p.conns.server)));
-        let Ends { ct, st: _st, .. } = open(&mut p, &mut reqs).await;
-        assert_eq!(udp(ct, None).max_payload(), Some(MAX_UDP_PAYLOAD));
+        let (mut p, mut reqs) = capsule_masque().await;
+        let (c, _s) = udp_pair(&mut p, &mut reqs).await;
+        assert_eq!(c.max_payload(), Some(MAX_UDP_PAYLOAD));
     })
     .await
 }
@@ -639,15 +505,14 @@ async fn max_payload_values() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn error_after_abort_is_sticky() {
     with_timeout(async {
-        let (mut p, mut reqs) = masque().await;
         for dgrams in [true, false] {
-            let Ends {
-                ct,
-                cd: _cd,
-                st,
-                sd,
-            } = open(&mut p, &mut reqs).await;
-            let mut s = udp(st, sd.filter(|_| dgrams));
+            let (mut p, mut reqs) = if dgrams {
+                masque().await
+            } else {
+                capsule_masque().await
+            };
+            let RawClient { ct, cd: _cd, mut s } = raw_client(&mut p, &mut reqs).await;
+            assert_eq!(s.carrier() == Carrier::Datagram, dgrams);
             ct.abort(MSG);
             // A peer RESET never turns into a clean end on a later call.
             for _ in 0..3 {

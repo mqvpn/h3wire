@@ -113,11 +113,6 @@ impl UdpTunnel {
         }
     }
 
-    #[doc(hidden)]
-    pub fn __from_parts(tunnel: Tunnel, dgrams: Option<Datagrams>, settings_ok: bool) -> Self {
-        Self::new(tunnel, dgrams, settings_ok)
-    }
-
     /// See [`UdpSender::send`].
     pub async fn send(&mut self, payload: Bytes) -> Result<(), UdpError> {
         self.send.send(payload).await
