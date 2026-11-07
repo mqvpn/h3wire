@@ -32,7 +32,7 @@ pub enum ConnectError {
 impl fmt::Display for ConnectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Template(e) => write!(f, "URI template: {e:?}"),
+            Self::Template(e) => e.fmt(f),
             Self::Http(e) => e.fmt(f),
             Self::Rejected(r) => write!(f, "CONNECT-UDP rejected: {}", r.status()),
             Self::Malformed => f.write_str("malformed CONNECT-UDP response"),
@@ -43,6 +43,7 @@ impl fmt::Display for ConnectError {
 impl std::error::Error for ConnectError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Template(e) => Some(e),
             Self::Http(e) => Some(e),
             _ => None,
         }

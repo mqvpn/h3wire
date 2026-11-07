@@ -66,11 +66,11 @@ async fn run() -> Result<bool, BoxError> {
     let (Some(ca), Some(template), Some(target)) = (ca, template, target) else {
         return Err(USAGE.into());
     };
-    let template = UriTemplate::parse(&template).map_err(|e| format!("--template: {e:?}"))?;
+    let template = UriTemplate::parse(&template).map_err(|e| format!("--template: {e}"))?;
     let target = parse_target(&target)?;
 
     // The proxy is the expanded URI's authority.
-    let uri = template.expand(&target).map_err(|e| format!("{e:?}"))?;
+    let uri = template.expand(&target)?;
     let host = uri.host().ok_or("the template has no host")?;
     let host = host
         .trim_start_matches('[')

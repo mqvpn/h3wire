@@ -33,6 +33,22 @@ pub enum TemplateError {
     NoMatch,
 }
 
+impl std::fmt::Display for TemplateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Syntax => "invalid URI template",
+            Self::NotHttps => "URI template scheme is not https",
+            Self::Variables => "URI template needs one target_host and one target_port",
+            Self::NotWholeSegment => "URI template variable is not a whole path segment",
+            Self::BadHost => "invalid target host",
+            Self::BadPort => "invalid target port",
+            Self::NoMatch => "URI does not match the template",
+        })
+    }
+}
+
+impl std::error::Error for TemplateError {}
+
 /// A CONNECT-UDP target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {

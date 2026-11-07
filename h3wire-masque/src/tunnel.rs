@@ -59,7 +59,7 @@ impl fmt::Display for UdpError {
         match self {
             Self::TooLarge => f.write_str("UDP payload too large"),
             Self::Closed => f.write_str("tunnel send side finished"),
-            Self::Datagram(e) => write!(f, "datagram refused: {e:?}"),
+            Self::Datagram(e) => write!(f, "datagram refused: {e}"),
             Self::Http(e) => e.fmt(f),
         }
     }
@@ -68,6 +68,7 @@ impl fmt::Display for UdpError {
 impl std::error::Error for UdpError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Datagram(e) => Some(e),
             Self::Http(e) => Some(e),
             _ => None,
         }

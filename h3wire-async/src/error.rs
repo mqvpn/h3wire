@@ -142,3 +142,16 @@ pub enum DatagramError {
     /// The request or connection has ended.
     Closed,
 }
+
+impl fmt::Display for DatagramError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotNegotiated => "peer SETTINGS have not confirmed H3_DATAGRAM yet",
+            Self::Unsupported => "peer does not support datagrams",
+            Self::TooLarge => "datagram exceeds the current limit",
+            Self::Closed => "request or connection has ended",
+        })
+    }
+}
+
+impl std::error::Error for DatagramError {}

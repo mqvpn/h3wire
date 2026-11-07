@@ -74,7 +74,7 @@ async fn main() -> Result<(), BoxError> {
     // Fail at startup, not per tunnel, where the Don't Fragment bit cannot be set.
     dont_fragment(&std::net::UdpSocket::bind("127.0.0.1:0")?)?;
     let template = Arc::new(match template {
-        Some(t) => UriTemplate::parse(&t).map_err(|e| format!("--template: {e:?}"))?,
+        Some(t) => UriTemplate::parse(&t).map_err(|e| format!("--template: {e}"))?,
         None => UriTemplate::default_for(&listen.parse::<Authority>()?),
     });
     let listen: SocketAddr = listen.parse()?;
