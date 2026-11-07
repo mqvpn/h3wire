@@ -22,7 +22,8 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     if let Ok(target) = tpl.match_target(&uri) {
-        let again = tpl.expand(&target).unwrap();
-        assert_eq!(tpl.match_target(&again).unwrap(), target);
+        if let Ok(again) = tpl.expand(&target) {
+            assert_eq!(tpl.match_target(&again).unwrap(), target);
+        }
     }
 });

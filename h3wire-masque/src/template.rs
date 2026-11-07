@@ -8,6 +8,7 @@
 
 use http::Uri;
 use http::uri::Authority;
+use std::fmt::Write;
 use std::net::{IpAddr, Ipv6Addr};
 use std::num::NonZeroU16;
 use std::str::FromStr;
@@ -51,7 +52,7 @@ impl Target {
 /// A target host: an IP literal or a DNS name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetHost {
-    /// A DNS name. Only non-empty, no `:` and no leading `[` is checked here; the builder decides the rest.
+    /// A DNS name. One that parses as an IP literal matches back as [`TargetHost::Ip`]. Only non-empty, no `:` and no leading `[` is checked here; the builder decides the rest.
     Name(String),
     /// An IP address.
     Ip(IpAddr),
@@ -75,15 +76,19 @@ pub struct UriTemplate {
 impl UriTemplate {
     /// Parse a template of the documented subset.
     pub fn parse(s: &str) -> Result<Self, TemplateError> {
-        let rest = s.strip_prefix("https://").ok_or_else(|| {
-            if s.get(..7)
-                .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        if s.contains('#') {
+            return Err(TemplateError::Syntax);
+        }
+        let rest = match s.split_at_checked(8) {
+            Some((scheme, rest)) if scheme.eq_ignore_ascii_case("https://") => rest,
+            _ if s
+                .get(..7)
+                .is_some_and(|p| p.eq_ignore_ascii_case("http://")) =>
             {
-                TemplateError::NotHttps
-            } else {
-                TemplateError::Syntax
+                return Err(TemplateError::NotHttps);
             }
-        })?;
+            _ => return Err(TemplateError::Syntax),
+        };
         let (authority, rest) = rest.split_once('/').ok_or(TemplateError::Syntax)?;
         let (path, query) = match rest.split_once('?') {
             Some((p, q)) => (p, Some(q.to_owned())),
@@ -178,6 +183,8 @@ impl UriTemplate {
         self.build(&host, &target.port.to_string())
     }
 
+    /// Literal segments are compared byte for byte, with no percent-decoding normalisation.
+    ///
     /// The target in `uri`'s path and query. The scheme and authority are not compared
     /// (spec §2.2). A malformed percent escape is `BadHost`/`BadPort`, not `NoMatch`.
     pub fn match_target(&self, uri: &Uri) -> Result<Target, TemplateError> {
@@ -246,7 +253,7 @@ fn encode(s: &str) -> String {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
             out.push(b as char);
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            let _ = write!(out, "%{b:02X}");
         }
     }
     out
@@ -301,6 +308,7 @@ mod tests {
             t
         );
         tpl();
+        UriTemplate::parse("HTTPS://p/{target_host}/{target_port}/").unwrap();
         UriTemplate::parse("https://p/{target_port}/x/{target_host}?k=v").unwrap();
     }
 
@@ -315,6 +323,9 @@ mod tests {
         assert_eq!(p("https://p/{target_host/{target_port}/"), Syntax);
         // The `?` splits the template there, so the braces land in the query.
         assert_eq!(p("https://p/{?x}/{target_host}/{target_port}"), Variables);
+        assert_eq!(p("https://p/{target_host}/{target_port}?a#b"), Syntax);
+        assert_eq!(p("https://p/{target_host}/{target_port}/x#y"), Syntax);
+        assert_eq!(p("Http://p/{target_host}/{target_port}/"), NotHttps);
         assert_eq!(p("https://p/{target_host}/"), Variables);
         assert_eq!(p("https://p/{target_port}/"), Variables);
         assert_eq!(
