@@ -8,7 +8,8 @@
 //! exists only once the response has been sent, so awaiting it inside the service
 //! deadlocks.
 //!
-//! h3wire-async is a stable candidate; 1.0 waits for a downstream user outside this workspace.
+//! h3wire-async is a stable candidate; 1.0 waits for a downstream user outside this
+//! workspace.
 //!
 //! ```no_run
 //! use bytes::Bytes;
