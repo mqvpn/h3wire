@@ -25,6 +25,9 @@ use std::future::{Future, poll_fn};
 use std::pin::pin;
 use std::task::{Context, Poll};
 
+/// Progress steps per carrier in one `recv` poll before yielding.
+const MAX_STEPS: usize = 32;
+
 /// The largest UDP payload a context-ID-0 tunnel carries (RFC 9298 section 5).
 pub const MAX_UDP_PAYLOAD: usize = 65_527;
 
@@ -105,7 +108,7 @@ impl UdpTunnel {
                 capsules: Capsules::default(),
                 dgram_first: false,
                 eof: false,
-                done: false,
+                end: None,
             },
         }
     }
@@ -178,7 +181,8 @@ impl UdpSender {
         if let Some(d) = &self.dgrams {
             return d.send(value).map_err(UdpError::Datagram);
         }
-        // One `Bytes` per capsule: `TunnelSend::send` takes it whole or not at all.
+        // One `TunnelSend::send` call per capsule: it takes the `Bytes` whole or not at
+        // all, so a cancelled send never leaves half a capsule on the stream.
         let mut b = BytesMut::new();
         capsule::encode(DATAGRAM, &value, &mut b).expect("within varint range");
         Ok(self.tunnel.send(b.freeze()).await?)
@@ -198,7 +202,8 @@ impl UdpSender {
 
     /// The largest payload [`send`](Self::send) accepts now: the datagram limit minus the
     /// context ID byte, at most [`MAX_UDP_PAYLOAD`] (as of the async driver's last pass);
-    /// `Some(MAX_UDP_PAYLOAD)` for the capsule carrier.
+    /// `Some(MAX_UDP_PAYLOAD)` for the capsule carrier. `None` with [`Carrier::Datagram`]
+    /// when the datagram limit is unknown now or leaves no room for a payload.
     pub fn max_payload(&self) -> Option<usize> {
         match &self.dgrams {
             Some(d) => d
@@ -229,8 +234,8 @@ pub struct UdpReceiver {
     dgram_first: bool,
     /// The tunnel's FIN arrived.
     eof: bool,
-    /// `recv` returned `Ok(None)`.
-    done: bool,
+    /// The terminal result `recv` returned (`Ok(None)` or an error), repeated after.
+    end: Option<Result<Option<Bytes>, UdpError>>,
 }
 
 impl UdpReceiver {
@@ -247,11 +252,14 @@ impl UdpReceiver {
     }
 
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>, UdpError>> {
-        if self.done {
-            return Poll::Ready(Ok(None));
+        if let Some(r) = &self.end {
+            return Poll::Ready(r.clone());
         }
+        let mut busy = false;
         for dgram in [self.dgram_first, !self.dgram_first] {
-            // Retry a carrier that made progress: a pushed chunk may complete a capsule.
+            // Retry a carrier that made progress (a pushed chunk may complete a capsule),
+            // a bounded number of times so a flood of dropped input cannot hog the poll.
+            let mut steps = 0;
             loop {
                 let r = if dgram {
                     self.poll_dgram(cx)
@@ -260,13 +268,23 @@ impl UdpReceiver {
                 };
                 match r {
                     Poll::Ready(Some(r)) => {
-                        self.done = matches!(r, Ok(None));
+                        // Errors are terminal too: the async layer reports an abort once.
+                        if !matches!(r, Ok(Some(_))) {
+                            self.end = Some(r.clone());
+                        }
                         return Poll::Ready(r);
                     }
-                    Poll::Ready(None) => {}
+                    Poll::Ready(None) if steps < MAX_STEPS => steps += 1,
+                    Poll::Ready(None) => {
+                        busy = true;
+                        break;
+                    }
                     Poll::Pending => break,
                 }
             }
+        }
+        if busy {
+            cx.waker().wake_by_ref();
         }
         Poll::Pending
     }

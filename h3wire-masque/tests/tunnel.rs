@@ -268,6 +268,9 @@ async fn nonzero_context_dropped() {
         // Context IDs 2 and 100 (a two-byte varint), both carriers.
         cd.send(Bytes::from_static(b"\x02x")).unwrap();
         cd.send(Bytes::from_static(b"\x40\x64y")).unwrap();
+        // No parseable context ID: dropped too.
+        cd.send(Bytes::new()).unwrap();
+        cd.send(Bytes::from_static(b"\x40")).unwrap();
         ct.send(cap(b"\x02z")).await.unwrap();
         ct.send(cap(b"\x40\x64w")).await.unwrap();
         cd.send(ctx0(b"d")).unwrap();
@@ -629,6 +632,29 @@ async fn max_payload_values() {
         assert_eq!(s.max_payload(), Some(limit(&p.conns.server)));
         let Ends { ct, st: _st, .. } = open(&mut p, &mut reqs).await;
         assert_eq!(udp(ct, None).max_payload(), Some(MAX_UDP_PAYLOAD));
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn error_after_abort_is_sticky() {
+    with_timeout(async {
+        let (mut p, mut reqs) = masque().await;
+        for dgrams in [true, false] {
+            let Ends {
+                ct,
+                cd: _cd,
+                st,
+                sd,
+            } = open(&mut p, &mut reqs).await;
+            let mut s = udp(st, sd.filter(|_| dgrams));
+            ct.abort(MSG);
+            // A peer RESET never turns into a clean end on a later call.
+            for _ in 0..3 {
+                let e = s.recv().await.unwrap_err();
+                assert!(udp_aborted(&e, MSG, AbortSource::Peer), "{dgrams}: {e:?}");
+            }
+        }
     })
     .await
 }
