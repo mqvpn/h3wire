@@ -83,23 +83,6 @@ fn forbidden(h: &HeaderMap) -> bool {
         .any(|n| h.contains_key(n))
 }
 
-/// `Capsule-Protocol` as received: `?1` is true; `?0`, a non-Boolean or a duplicated
-/// field is absent (false); parameters are ignored (RFC 9297 section 3.4). Nothing acts
-/// on it (CONNECT-UDP always uses the capsule protocol), so it only pins the rule.
-#[cfg(test)]
-fn capsule_protocol(h: &HeaderMap) -> bool {
-    let mut v = h.get_all("capsule-protocol").iter();
-    let (Some(v), None) = (v.next(), v.next()) else {
-        return false;
-    };
-    let item = v
-        .as_bytes()
-        .split(|&b| b == b';')
-        .next()
-        .unwrap_or_default();
-    item.trim_ascii() == b"?1"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,23 +99,5 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("capsule-protocol", HeaderValue::from_static("?1"));
         assert!(!forbidden(&h));
-    }
-
-    #[test]
-    fn capsule_protocol_parsing() {
-        let parse = |vals: &[&'static str]| {
-            let mut h = HeaderMap::new();
-            for v in vals {
-                h.append("capsule-protocol", HeaderValue::from_static(v));
-            }
-            capsule_protocol(&h)
-        };
-        assert!(parse(&["?1"]));
-        assert!(parse(&["?1;a=b"]));
-        assert!(parse(&[" ?1 "]));
-        assert!(!parse(&[]));
-        assert!(!parse(&["?0"]));
-        assert!(!parse(&["1"]));
-        assert!(!parse(&["?1", "?1"]));
     }
 }
