@@ -14,7 +14,9 @@ use super::upgrade::{
 use crate::__testing::exec::{TestExec, run};
 use crate::__testing::{CorePeer, MockConn, MockNet, MockObs, PeerObs, Side};
 use crate::builder::Builder;
-use crate::datagram::{DatagramSlot, Datagrams, RegisterDatagrams};
+use crate::datagram::{
+    DatagramReceiver, DatagramSender, DatagramSlot, Datagrams, RegisterDatagrams,
+};
 use crate::error::{DatagramError, ErrorKind};
 use crate::ext::ConnInfo;
 use crate::upgrade;
@@ -91,6 +93,18 @@ async fn wait(peer: &mut Peer, mut pred: impl FnMut(&Peer) -> bool) {
         yield_now().await;
     }
     panic!("condition not reached: {:?}", peer.trace());
+}
+
+/// Step the peer and let every task run a fixed number of times (nothing to wait on).
+async fn settle(peer: &mut Peer) {
+    for _ in 0..64 {
+        poll_fn(|cx| {
+            while peer.poll_step(cx).is_ready() {}
+            Poll::Ready(())
+        })
+        .await;
+        yield_now().await;
+    }
 }
 
 /// The next datagram of `d`, stepping the peer meanwhile.
@@ -272,7 +286,7 @@ fn registered_rejected_connect_drops_silently() {
         assert_eq!(next(&mut peer, &mut d).await, None, "the request ended");
         drop(req);
         drop(d);
-        wait(&mut peer, |_| true).await;
+        settle(&mut peer).await;
         assert!(!aborted_any(&net, s), "{:?}", net.trace());
     });
 }
@@ -582,27 +596,35 @@ async fn registered(p: &mut Pair) -> (Datagrams, Datagrams, impl Sized + use<>) 
     (sd, cd, (on, req, resp))
 }
 
+fn _assert_auto_traits() {
+    fn send_sync_clone<T: Send + Sync + Clone>() {}
+    fn send<T: Send>() {}
+    send_sync_clone::<DatagramSender>();
+    send::<DatagramReceiver>();
+}
+
 #[test]
 fn split_send_and_recv_independent() {
     let mut p = plain();
     let exec = p.exec.clone();
     run(&exec, async {
         let (sd, cd, _keep) = registered(&mut p).await;
-        let (_stx, mut srx) = sd.split();
+        let (stx, mut srx) = sd.split();
         let (ctx, _crx) = cd.split();
         let sender = ctx.clone();
-        let (got, ()) = futures::join!(srx.recv(), async move {
-            yield_now().await;
+        // From another task while `recv` is pending.
+        let sent = spawn(&exec, async move {
             sender.send(Bytes::from_static(b"hi")).unwrap();
         });
-        assert_eq!(got.unwrap().unwrap(), "hi");
-        assert_eq!(ctx.max_payload(), _stx.max_payload());
+        assert_eq!(srx.recv().await.unwrap().unwrap(), "hi");
+        until(|| sent.lock().unwrap().is_some()).await;
+        assert_eq!(ctx.max_payload(), stx.max_payload());
     });
 }
 
 #[test]
 fn split_registration_held_until_both_dropped() {
-    let (net, _info, mut peer, mut reqs, exec) = server(&Builder::new(), true);
+    let (net, info, mut peer, mut reqs, exec) = server(&Builder::new(), true);
     run(&exec, async {
         let (s, (mut req, tx)) = open(&mut peer, &mut reqs, &CONNECT).await;
         let (stx, srx) = slot(&req).register().unwrap().split();
@@ -618,8 +640,10 @@ fn split_registration_held_until_both_dropped() {
         wait(&mut peer, |p| peer_got(p, s, 5)).await;
         drop(stx);
         peer.send_datagram(s, b"late").unwrap();
-        wait(&mut peer, |_| true).await;
+        settle(&mut peer).await;
+        assert!(!dg_abort(&net, Side::Server, s), "{:?}", net.trace());
         assert!(!aborted_any(&net, s), "{:?}", net.trace());
+        assert_eq!(info.__debug_datagram_accounting(), (0, 0, 0), "discarded");
     });
 }
 

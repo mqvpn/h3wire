@@ -130,7 +130,8 @@ impl Datagrams {
     }
 
     /// Split into a cloneable sender and a receiver. The registration stays until every
-    /// clone and the receiver are gone.
+    /// clone and the receiver are gone: after the receiver is dropped, inbound datagrams
+    /// keep queueing (bounded, oldest evicted) while any sender lives.
     pub fn split(self) -> (DatagramSender, DatagramReceiver) {
         let d = Arc::new(self);
         (DatagramSender(d.clone()), DatagramReceiver(d))
