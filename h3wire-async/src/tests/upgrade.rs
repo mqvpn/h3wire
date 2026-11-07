@@ -949,6 +949,31 @@ fn on_upgrade_abort_wakes_pending_claim() {
     drop(net);
 }
 
+/// A peer reset recorded before `abort` stays the claim's result: the abort does not
+/// replace it with the local code.
+#[test]
+fn on_upgrade_abort_keeps_earlier_peer_reset() {
+    let mut p = plain();
+    let exec = p.exec.clone();
+    run(&exec, async {
+        let (resp, (mut req, tx)) = request(&mut p, connect()).await;
+        let on = upgrade::on(&mut req);
+        drop(req);
+        tx.send(reply(200, "")).unwrap();
+        let server = on.await.expect("server tunnel");
+        let mut resp = out(&resp).await.expect("a response");
+        let on = upgrade::on(&mut resp);
+        server.abort(H3Code::INTERNAL_ERROR);
+        quiesce().await;
+        on.abort(MESSAGE_ERROR);
+        let e = on.await.expect_err("reset");
+        assert!(
+            is_aborted(&e, H3Code::INTERNAL_ERROR, AbortSource::Peer),
+            "{e:?}"
+        );
+    });
+}
+
 /// A code the core refuses (`H3_REQUEST_REJECTED` on a delivered request) makes `abort` a
 /// no-op: the 200 that follows still opens the tunnel.
 #[test]
