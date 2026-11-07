@@ -3,8 +3,9 @@
 //! The connection driver: owns the QUIC objects and runs the core's driving loop.
 //!
 //! One `poll` runs rounds until nothing moves or a work budget (transport operations
-//! that returned `Ready`) is spent; then it wakes itself and yields. Datagram receive has
-//! its own budget of the same size, so stream work cannot starve it, nor it stream work.
+//! that returned `Ready`) is spent; then it wakes itself and yields. Datagram send and
+//! datagram receive each have their own budget of the same size, so none of stream work,
+//! sends and receives can starve another.
 //! A round:
 //! 1. executes core actions and opens local uni streams;
 //! 2. accepts peer streams; a client opens streams for queued requests;
@@ -150,7 +151,7 @@ impl<C: quic::Connection> Driver<C> {
         &mut self,
         cx: &mut Context<'_>,
         budget: &mut usize,
-        dgram_budget: &mut usize,
+        dgram_budget: &mut (usize, usize),
     ) -> Result<bool, TransportError> {
         let mut moved = self.actions(cx, budget)?;
         if self.shared.with(|i| i.close.is_some()) {
@@ -514,7 +515,7 @@ impl<C: quic::Connection> Future for Driver<C> {
         this.shared
             .with(|i| i.driver_waker = Some(cx.waker().clone()));
         let mut budget = this.work_budget;
-        let mut dgram_budget = this.work_budget;
+        let mut dgram_budget = (this.work_budget, this.work_budget);
         loop {
             if let Some(r) = this.outcome() {
                 return Poll::Ready(r);
@@ -527,7 +528,7 @@ impl<C: quic::Connection> Future for Driver<C> {
                     true
                 }
             };
-            if budget == 0 || dgram_budget == 0 {
+            if budget == 0 || dgram_budget.0 == 0 || dgram_budget.1 == 0 {
                 if let Some(r) = this.outcome() {
                     return Poll::Ready(r);
                 }

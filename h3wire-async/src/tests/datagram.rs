@@ -506,6 +506,71 @@ fn datagram_receive_never_blocks_driver() {
     });
 }
 
+/// Sends are budgeted too: one `poll` hands at most `work_budget` queued datagrams to
+/// the transport, and the rest go on later polls.
+#[test]
+fn datagram_send_within_budget() {
+    let (net, c, s) = MockNet::pair();
+    let exec = TestExec::default();
+    let (tx, mut reqs) = mpsc::unbounded();
+    let mut b = Builder::new();
+    b.work_budget(4);
+    let mut srv = b.serve_connection(s, Handoff(tx), exec.clone());
+    let mut peer = CorePeer::new(Role::Client, peer_cfg(true), c);
+    let sent = |net: &MockNet| {
+        let t = net.trace();
+        t.iter()
+            .filter(|o| {
+                matches!(
+                    o,
+                    MockObs::Datagram {
+                        side: Side::Server,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    run(&exec, async {
+        async fn go<F: Future + Unpin>(
+            peer: &mut Peer,
+            srv: &mut (impl Future + Unpin),
+            f: &mut F,
+        ) -> F::Output {
+            poll_fn(|cx| {
+                loop {
+                    if let Poll::Ready(v) = Pin::new(&mut *f).poll(cx) {
+                        return Poll::Ready(v);
+                    }
+                    assert!(Pin::new(&mut *srv).poll(cx).is_pending());
+                    if peer.poll_step(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                }
+            })
+            .await
+        }
+        let s = peer.open_bidi().await.unwrap();
+        peer.send_headers(s, &POST, false).unwrap();
+        let (req, _tx) = go(&mut peer, &mut srv, &mut reqs.next()).await.unwrap();
+        let d = slot(&req).register().unwrap();
+        while d.max_payload().is_none() || peer.core().peer_settings().is_none() {
+            go(&mut peer, &mut srv, &mut pin!(yield_now())).await;
+        }
+        let before = sent(&net);
+        for n in 0..50u8 {
+            d.send(Bytes::from(vec![n])).unwrap();
+        }
+        assert!(poll_once(&mut srv).await.is_pending());
+        let n = sent(&net) - before;
+        assert!(n > 0 && n <= 4, "{n} sent in one poll");
+        for _ in 0..20 {
+            assert!(poll_once(&mut srv).await.is_pending());
+        }
+        assert_eq!(sent(&net) - before, 50);
+    });
+}
+
 #[test]
 fn slot_clone_single_registration() {
     let mut p = plain();

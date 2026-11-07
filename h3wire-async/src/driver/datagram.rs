@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 mp0rta
-//! HTTP datagrams in the driver (spec §3.4): send what the handles queued, drain the
-//! transport within its own work budget (spec §3.3), and route each datagram. Routing
-//! never waits on a handle: every queue is bounded and drops its oldest entry.
+//! HTTP datagrams in the driver (spec §3.4): send what the handles queued and drain the
+//! transport, each within its own work budget (spec §3.3), and route each datagram.
+//! Routing never waits on a handle: every queue is bounded and drops its oldest entry.
 //!
 //! | `parse_datagram` | stream | action |
 //! |---|---|---|
@@ -185,18 +185,20 @@ impl Inner {
 }
 
 impl<C: quic::Connection> Driver<C> {
-    /// Refresh the limit, hand the queued datagrams to the transport, then receive and
-    /// route datagrams while the budget lasts.
+    /// Refresh the limit, hand queued datagrams to the transport, then receive and route
+    /// datagrams, each while its budget (send, receive) lasts; the rest stay queued.
     pub(super) fn datagrams(
         &mut self,
         cx: &mut Context<'_>,
-        budget: &mut usize,
+        (send_budget, budget): &mut (usize, usize),
     ) -> Result<bool, TransportError> {
         let limit = self.conn.max_datagram_size();
         let (on, out) = self.shared.with(|i| {
             i.dgram.limit = limit;
-            (i.dgram.on, std::mem::take(&mut i.dgram.out))
+            let n = i.dgram.out.len().min(*send_budget);
+            (i.dgram.on, i.dgram.out.drain(..n).collect::<Vec<_>>())
         });
+        *send_budget -= out.len();
         let mut moved = !out.is_empty();
         for d in out {
             // TooLarge (the limit shrank since `send`) or Unsupported: lost, as a

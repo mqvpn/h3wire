@@ -109,8 +109,8 @@ impl Builder {
     }
 
     /// Transport operations per driver pass before it yields, counted separately for
-    /// stream work and for datagram receive: each gets `n`, so one poll may do up to
-    /// 2 × `n`. Default 64; 0 counts as 1.
+    /// stream work, datagram send and datagram receive: each gets `n`, so one poll may
+    /// do up to 3 × `n`. Default 64; 0 counts as 1.
     pub fn work_budget(&mut self, n: usize) -> &mut Self {
         self.work_budget = n;
         self
