@@ -167,6 +167,8 @@ async fn open(target: &Target) -> io::Result<UdpSocket> {
             .next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address"))?,
     };
+    // An IPv4-mapped address goes out over IPv4, where only the IPv4 DF option applies.
+    let addr = SocketAddr::new(addr.ip().to_canonical(), port);
     let bind: SocketAddr = if addr.is_ipv6() {
         "[::]:0"
     } else {
@@ -296,6 +298,14 @@ mod tests {
         assert_eq!(
             sockopt::ipv6_mtu_discover(&s).unwrap(),
             Ipv6PathMtuDiscovery::DO
+        );
+        // An IPv4-mapped target goes out over IPv4, so it needs the IPv4 option.
+        let mapped = std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        let s = open(&target(mapped.into())).await.unwrap();
+        assert!(s.local_addr().unwrap().is_ipv4());
+        assert_eq!(
+            sockopt::ip_mtu_discover(&s).unwrap(),
+            Ipv4PathMtuDiscovery::DO
         );
     }
 
