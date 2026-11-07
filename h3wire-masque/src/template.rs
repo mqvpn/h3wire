@@ -52,7 +52,10 @@ impl Target {
 /// A target host: an IP literal or a DNS name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetHost {
-    /// A DNS name. One that parses as an IP literal matches back as [`TargetHost::Ip`]. Only non-empty, no `:` and no leading `[` is checked here; the builder decides the rest.
+    /// A DNS name. One that parses as an IP literal matches back as [`TargetHost::Ip`].
+    /// Checked here: non-empty, no `:`, no leading `[`, and (when matched) valid UTF-8
+    /// after percent-decoding. Any further name policy is the application's (RFC 9298
+    /// section 3.1).
     Name(String),
     /// An IP address.
     Ip(IpAddr),
@@ -76,7 +79,8 @@ pub struct UriTemplate {
 impl UriTemplate {
     /// Parse a template of the documented subset.
     pub fn parse(s: &str) -> Result<Self, TemplateError> {
-        if s.contains('#') {
+        // RFC 9298 section 2: printable ASCII only (other text must be percent-encoded).
+        if s.contains('#') || !s.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
             return Err(TemplateError::Syntax);
         }
         let rest = match s.split_at_checked(8) {
@@ -183,10 +187,10 @@ impl UriTemplate {
         self.build(&host, &target.port.to_string())
     }
 
-    /// Literal segments are compared byte for byte, with no percent-decoding normalisation.
-    ///
     /// The target in `uri`'s path and query. The scheme and authority are not compared
     /// (spec §2.2). A malformed percent escape is `BadHost`/`BadPort`, not `NoMatch`.
+    ///
+    /// Literal segments are compared byte for byte, with no percent-decoding normalisation.
     pub fn match_target(&self, uri: &Uri) -> Result<Target, TemplateError> {
         if uri.query() != self.query.as_deref() {
             return Err(TemplateError::NoMatch);
@@ -349,6 +353,13 @@ mod tests {
             NotWholeSegment
         );
         assert_eq!(p("https://p/{target_host}1{target_port}/"), NotWholeSegment);
+        // RFC 9298 section 2: ASCII 0x21-0x7E only; percent-encoded literals are fine.
+        assert_eq!(
+            p("https://proxy/\u{e9}/{target_host}/{target_port}/"),
+            Syntax
+        );
+        assert_eq!(p("https://proxy/a b/{target_host}/{target_port}/"), Syntax);
+        assert!(UriTemplate::parse("https://proxy/%C3%A9/{target_host}/{target_port}/").is_ok());
     }
 
     #[test]
