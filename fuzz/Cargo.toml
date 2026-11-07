@@ -14,6 +14,7 @@ arbitrary = { version = "1", features = ["derive"] }
 h3wire = { path = "../h3wire" }
 h3wire-masque = { path = "../h3wire-masque" }
 bytes = "1"
+http = "1"
 
 # Not a member of the main workspace.
 [workspace]
@@ -50,6 +51,13 @@ bench = false
 [[bin]]
 name = "capsule_decoder"
 path = "fuzz_targets/capsule_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "template_match"
+path = "fuzz_targets/template_match.rs"
 test = false
 doc = false
 bench = false

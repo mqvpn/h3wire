@@ -93,6 +93,7 @@ dependencies = [
  "bytes",
  "h3wire",
  "h3wire-masque",
+ "http",
  "libfuzzer-sys",
 ]
 

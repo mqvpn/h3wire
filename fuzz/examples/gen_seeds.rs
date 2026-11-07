@@ -604,6 +604,41 @@ fn capsule_seeds() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
+/// `template`, a NUL byte, then a request URI.
+fn template_seeds() -> Vec<(&'static str, Vec<u8>)> {
+    let t = "https://proxy.example/.well-known/masque/udp/{target_host}/{target_port}/";
+    let with = |tpl: &str, uri: &str| [tpl.as_bytes(), b"\0", uri.as_bytes()].concat();
+    let p = "/.well-known/masque/udp";
+    vec![
+        ("default_ipv4", with(t, &format!("{p}/192.0.2.6/443/"))),
+        (
+            "default_ipv6",
+            with(t, &format!("{p}/2001%3Adb8%3A%3A1/443/")),
+        ),
+        (
+            "default_name",
+            with(t, &format!("{p}/a%25b%2Fc.example/53/")),
+        ),
+        ("zone_id", with(t, &format!("{p}/fe80%3A%3A1%25eth0/80/"))),
+        (
+            "query",
+            with("https://p/{target_port}/x/{target_host}?k=v", "/80/x/h?k=v"),
+        ),
+        (
+            "reject_http",
+            with("http://p/{target_host}/{target_port}/", "/h/80/"),
+        ),
+        (
+            "reject_partial",
+            with("https://p/x{target_host}/{target_port}/", "/xh/80/"),
+        ),
+        (
+            "reject_expr",
+            with("https://p/{+target_host}/{target_port}/", "/h/80/"),
+        ),
+    ]
+}
+
 fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("seeds");
     let targets = [
@@ -612,6 +647,7 @@ fn main() {
         ("wire", wire_seeds()),
         ("api_ops", api_seeds()),
         ("capsule_decoder", capsule_seeds()),
+        ("template_match", template_seeds()),
     ];
     for (target, seeds) in targets {
         let dir = root.join(target);

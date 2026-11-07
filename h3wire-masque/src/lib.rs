@@ -5,3 +5,4 @@
 #![warn(missing_docs)]
 
 pub mod capsule;
+pub mod template;
