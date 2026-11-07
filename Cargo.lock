@@ -388,6 +388,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "h3wire-masque"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "h3wire-async",
+ "http",
+ "http-body",
+ "proptest",
+]
+
+[[package]]
 name = "h3wire-quinn"
 version = "0.1.0"
 dependencies = [

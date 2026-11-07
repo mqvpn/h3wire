@@ -1,0 +1,22 @@
+[package]
+name = "h3wire-masque"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "MASQUE CONNECT-UDP (RFC 9298) and the HTTP capsule codec (RFC 9297) over h3wire-async"
+repository = "https://github.com/mp0rta/h3wire"
+documentation = "https://docs.rs/h3wire-masque"
+readme = "README.md"
+keywords = ["masque", "http3", "quic", "connect-udp", "capsule"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+h3wire-async = { path = "../h3wire-async", version = "0.1.0" }
+bytes = "1"
+http = "1"
+http-body = "1"
+futures-core = "0.3"
+
+[dev-dependencies]
+proptest = "1"

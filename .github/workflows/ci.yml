@@ -92,7 +92,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [frame, qpack_decoder, wire, api_ops]
+        target: [frame, qpack_decoder, wire, api_ops, capsule_decoder]
     env:
       # Pull requests and pushes: seed + corpus replay, then a 30 s smoke run. Weekly: 30 min.
       FUZZ_SECONDS: ${{ github.event_name == 'schedule' && 1800 || 30 }}
