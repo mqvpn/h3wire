@@ -21,9 +21,10 @@ fuzz_target!(|data: &[u8]| {
     let (Ok(tpl), Ok(uri)) = (UriTemplate::parse(tpl), uri.parse::<Uri>()) else {
         return;
     };
-    if let Ok(target) = tpl.match_target(&uri) {
-        if let Ok(again) = tpl.expand(&target) {
-            assert_eq!(tpl.match_target(&again).unwrap(), target);
-        }
+    let Ok(target) = tpl.match_target(&uri) else {
+        return;
+    };
+    if let Ok(again) = tpl.expand(&target) {
+        assert_eq!(tpl.match_target(&again).unwrap(), target);
     }
 });
