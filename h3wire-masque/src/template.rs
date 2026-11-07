@@ -113,6 +113,9 @@ impl UriTemplate {
         if authority.contains(['{', '}']) {
             return Err(TemplateError::Variables);
         }
+        if !literal(authority) {
+            return Err(TemplateError::Syntax);
+        }
         Authority::from_str(authority).map_err(|_| TemplateError::Syntax)?;
         let (path, query) = match rest.split_once('?') {
             Some((p, q)) => (p, Some(q.to_owned())),
@@ -397,6 +400,12 @@ mod tests {
         assert!(UriTemplate::parse("https://proxy/%C3%A9/{target_host}/{target_port}/").is_ok());
         // The authority ends at the first `/`: a query before it is not an authority.
         assert_eq!(p("https://proxy?x=/{target_host}/{target_port}/"), Syntax);
+        // Authority literals follow the same rules.
+        assert_eq!(
+            p("https://bad%zz@127.0.0.1/{target_host}/{target_port}/"),
+            Syntax
+        );
+        assert_eq!(p("https://pro'xy/{target_host}/{target_port}/"), Syntax);
         // RFC 6570 section 2.1 literals, in the path and the query.
         for bad in [
             "%zz", "%4", "a|b", "a^b", "a\\b", "a<b", "a\"b", "a'b", "a`b",
