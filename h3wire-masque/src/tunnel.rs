@@ -13,6 +13,7 @@
 //!   [`MAX_UDP_PAYLOAD`], aborts the request with `H3_MESSAGE_ERROR`.
 //! - **Lifetime.** As the v0.2 [`Tunnel`] halves: dropping a half before its direction
 //!   ended aborts with `H3_REQUEST_CANCELLED`.
+//! - **Threads.** [`UdpTunnel`], [`UdpSender`] and [`UdpReceiver`] are `Send` and `Sync`.
 
 use crate::capsule::{self, CapsuleError, DATAGRAM, Decoder};
 use bytes::{Bytes, BytesMut};
@@ -358,6 +359,13 @@ impl UdpReceiver {
         )
     }
 }
+
+const _: () = {
+    const fn send_sync<T: Send + Sync>() {}
+    send_sync::<UdpTunnel>();
+    send_sync::<UdpSender>();
+    send_sync::<UdpReceiver>();
+};
 
 /// Where the capsule decoder stands in the current capsule.
 #[derive(Clone, Copy, Debug, Default)]
