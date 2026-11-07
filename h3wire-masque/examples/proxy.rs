@@ -222,37 +222,62 @@ async fn relay(pending: Pending, sock: UdpSocket) {
         Ok(t) => t,
         Err(e) => return eprintln!("tunnel: {e}"),
     };
+    pump(tunnel, sock).await
+}
+
+/// The two directions run side by side, so one waiting for credit never stops the
+/// other; the first to end ends both.
+async fn pump(tunnel: UdpTunnel, sock: UdpSocket) {
     let (mut tx, mut rx) = tunnel.split();
-    let mut buf = vec![0; MAX_UDP_PAYLOAD];
-    loop {
-        tokio::select! {
-            p = rx.recv() => match p {
+    // `true`: the client finished the tunnel.
+    let up = async {
+        loop {
+            match rx.recv().await {
                 Ok(Some(p)) => {
                     if let Err(e) = sent(sock.send(&p).await) {
-                        return eprintln!("target socket: {e}");
+                        eprintln!("target socket: {e}");
+                        return false;
                     }
                 }
-                Ok(None) => {
-                    let _ = tx.finish();
-                    return;
+                Ok(None) => return true,
+                Err(e) => {
+                    eprintln!("tunnel: {e}");
+                    return false;
                 }
-                Err(e) => return eprintln!("tunnel: {e}"),
-            },
-            n = sock.recv(&mut buf) => match n {
+            }
+        }
+    };
+    let down = async {
+        let mut buf = vec![0; MAX_UDP_PAYLOAD];
+        loop {
+            match sock.recv(&mut buf).await {
                 Ok(n) => match tx.send(Bytes::copy_from_slice(&buf[..n])).await {
                     // Over the datagram limit: a loss (a full send queue drops the oldest).
                     Ok(()) | Err(UdpError::Datagram(DatagramError::TooLarge)) => {}
                     Err(e) => return eprintln!("tunnel: {e}"),
                 },
                 Err(e) => return eprintln!("target socket: {e}"),
-            },
+            }
         }
+    };
+    let fin = tokio::select! {
+        fin = up => fin,
+        () = down => false,
+    };
+    if fin {
+        let _ = tx.finish();
     }
 }
 
 #[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/support.rs"]
+mod support;
+
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::support::*;
+    use h3wire_async::Builder;
     use rustix::net::sockopt::{self, Ipv4PathMtuDiscovery, Ipv6PathMtuDiscovery};
     use std::net::Ipv6Addr;
 
@@ -281,5 +306,45 @@ mod tests {
         let refused = rustix::io::Errno::CONNREFUSED.raw_os_error();
         assert!(sent(Err(io::Error::from_raw_os_error(refused))).is_err());
         assert!(sent(Ok(3)).is_ok());
+    }
+
+    /// A client that stops reading stalls the proxy's capsule sends to it; payloads from
+    /// the client still reach the target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_downstream_keeps_upstream_flowing() {
+        with_timeout(async {
+            let (mut p, mut reqs) = masque_over(conns_no_datagrams().await, &Builder::new()).await;
+            let (mut c, s) = udp_pair(&mut p, &mut reqs).await;
+            let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let port = peer.local_addr().unwrap().port().try_into().unwrap();
+            let sock = open(&Target::new(TargetHost::Ip([127, 0, 0, 1].into()), port))
+                .await
+                .unwrap();
+            peer.connect(("127.0.0.1", sock.local_addr().unwrap().port()))
+                .await
+                .unwrap();
+            tokio::spawn(pump(s, sock));
+            let peer = Arc::new(peer);
+            // The target floods; the client never reads, so the proxy's sends stall.
+            let flood = tokio::spawn({
+                let peer = peer.clone();
+                async move {
+                    loop {
+                        let _ = peer.send(&[7; 1200]).await;
+                        tokio::task::yield_now().await;
+                    }
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            c.send(Bytes::from_static(b"up")).await.unwrap();
+            let mut buf = [0; 16];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(2), peer.recv(&mut buf))
+                .await
+                .expect("the client's payload never reached the target")
+                .unwrap();
+            assert_eq!(&buf[..n], b"up");
+            flood.abort();
+        })
+        .await
     }
 }
