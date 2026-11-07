@@ -25,7 +25,7 @@ use crate::error::{Error, ErrorKind};
 use crate::slot::OnceSlot;
 use crate::state::{Dir, End, Inner, Shared, Up};
 use bytes::Bytes;
-use h3wire::{H3Code, StreamId, UsageError};
+use h3wire::{AbortSource, H3Code, StreamId, UsageError};
 use http::{Request, Response};
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
@@ -141,6 +141,33 @@ pub fn on<T: Upgradable>(msg: &mut T) -> OnUpgrade {
 /// Resolves to the [`Tunnel`] once a 2xx went out (server) or at once (client).
 pub struct OnUpgrade {
     claim: Option<Claim>,
+}
+
+impl OnUpgrade {
+    /// Abort the whole request with `code`, e.g. to reject a CONNECT before any response;
+    /// idempotent. This future then resolves to `StreamAborted { code, Local }`, and a
+    /// response returned afterwards is discarded. Does nothing without a claim.
+    pub fn abort(&self, code: H3Code) {
+        let Some(c) = &self.claim else { return };
+        c.shared.with(|i| {
+            i.abort_local(c.id, code);
+            let Some(st) = i.streams.get_mut(&c.id) else {
+                return;
+            };
+            if matches!(st.up, Up::Claimed | Up::Active) {
+                st.up = Up::Failed(
+                    ErrorKind::StreamAborted {
+                        code,
+                        source: AbortSource::Local,
+                        retryable: false,
+                    }
+                    .into(),
+                );
+                // A receive side already finished is not woken by the abort.
+                i.pending_wakers.extend(st.recv.waker.take());
+            }
+        });
+    }
 }
 
 impl std::fmt::Debug for OnUpgrade {
