@@ -166,7 +166,8 @@ impl Datagrams {
     }
 
     /// The largest payload [`send`](Self::send) accepts now: the transport's limit minus
-    /// this request's quarter stream id length. `None` until negotiation completes, or
+    /// this request's quarter stream id length, as of the driver's last pass (it can
+    /// change right after). `None` until negotiation completes, or
     /// when datagrams cannot be sent.
     pub fn max_payload(&self) -> Option<usize> {
         self.shared.with(|i| {

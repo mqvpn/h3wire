@@ -951,3 +951,72 @@ fn ext_connect_after_graceful_shutdown_is_refused() {
     });
     assert_eq!(net.closed_with(Side::Client), Some(0x100));
 }
+
+/// Requests still waiting for stream credit when GOAWAY arrives never started: the
+/// error is `GoingAway` and retryable (spec §3.5 B6).
+#[test]
+fn goaway_unsent_queued_request_is_retryable() {
+    let (net, mut send, conn, mut peer, exec) =
+        client::<String>(&Builder::new(), Config::default());
+    net.max_bidi_streams(Side::Client, 1);
+    let _drv = spawn(&exec, conn);
+    run(&exec, async {
+        let _a = spawn(&exec, send.send_request(get("https://a/a")));
+        peer.run_until(|p| seen(p, S0)).await;
+        let queued = spawn(&exec, send.send_request(get("https://a/q"))); // no credit
+        settle(&mut peer).await;
+        assert!(!done(&queued));
+        peer.finish_shutdown().unwrap();
+        peer.run_until(|_| done(&queued)).await;
+        let e = take(&queued).unwrap_err();
+        assert!(matches!(e.kind(), ErrorKind::Usage(UsageError::GoingAway)));
+        assert!(e.is_retryable(), "{e:?}");
+    });
+}
+
+#[test]
+fn send_request_after_goaway_is_retryable() {
+    let (_net, mut send, conn, mut peer, exec) =
+        client::<String>(&Builder::new(), Config::default());
+    let _drv = spawn(&exec, conn);
+    run(&exec, async {
+        peer.finish_shutdown().unwrap();
+        settle(&mut peer).await;
+        let e = send.send_request(get("https://a/c")).await.unwrap_err();
+        assert!(matches!(e.kind(), ErrorKind::Usage(UsageError::GoingAway)));
+        assert!(e.is_retryable(), "{e:?}");
+    });
+}
+
+/// Pins today's `refused()` (spec §3.5 B5): an explicit local `graceful_shutdown` while
+/// an Extended CONNECT waits for SETTINGS refuses it as `Closed`, not retryable.
+#[test]
+fn extended_connect_pending_settings_refused_at_shutdown() {
+    let (_net, mut send, mut conn, mut peer, exec) =
+        client::<String>(&Builder::new(), connect_enabled());
+    peer.defer_control(true);
+    run(&exec, async {
+        let out = spawn(&exec, send.send_request(ext_connect()));
+        for _ in 0..4 {
+            let _ = poll_once(&mut Box::pin(drive(&mut peer, &mut conn))).await;
+        }
+        assert!(!done(&out));
+        Pin::new(&mut conn).graceful_shutdown();
+        peer.bind_control_now();
+        let _ = drive(&mut peer, &mut conn).await;
+        settle(&mut peer).await;
+        let e = take(&out).unwrap_err();
+        assert!(
+            matches!(
+                e.kind(),
+                ErrorKind::Closed {
+                    code: H3Code::NO_ERROR,
+                    by_peer: false
+                }
+            ),
+            "{e:?}"
+        );
+        assert!(!e.is_retryable());
+        assert!(!seen(&peer, S0), "nothing sent");
+    });
+}

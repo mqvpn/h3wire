@@ -72,15 +72,16 @@ impl Error {
         }
     }
 
-    /// Whether the request is safe to retry on another connection (a GOAWAY cutoff or a
-    /// peer `H3_REQUEST_REJECTED`).
+    /// Whether the request is safe to retry on another connection: it was never sent
+    /// ([`UsageError::GoingAway`]), fell past the GOAWAY cutoff, or the peer sent
+    /// `H3_REQUEST_REJECTED`.
     pub fn is_retryable(&self) -> bool {
         matches!(
             self.kind,
             ErrorKind::StreamAborted {
                 retryable: true,
                 ..
-            }
+            } | ErrorKind::Usage(UsageError::GoingAway)
         )
     }
 }

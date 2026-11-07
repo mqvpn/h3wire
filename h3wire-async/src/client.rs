@@ -461,6 +461,10 @@ impl<C: quic::Connection> ClientConnection<C> {
     /// Refuse new requests, wait for those in flight (their responses taken, both
     /// directions ended and our side acknowledged), then close with `H3_NO_ERROR`.
     ///
+    /// An Extended CONNECT still waiting for the peer's SETTINGS is refused with
+    /// `Closed { code: H3_NO_ERROR, by_peer: false }` (not retryable), as is any request
+    /// made after this call; a GOAWAY from the peer instead gives a retryable `GoingAway`.
+    ///
     /// There is no time limit: wrap the connection in your own timeout and drop it.
     pub fn graceful_shutdown(self: Pin<&mut Self>) {
         self.driver.shared().with(|i| {
