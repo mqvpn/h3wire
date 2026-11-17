@@ -1456,7 +1456,8 @@ fn check(w: &World, mock: &[MockObs]) -> Result<(), String> {
         let info = ConnInfo::new(sh.clone());
         let (queued, reservations, _) = info.__debug_recv_accounting();
         let bound = l.cap + l.demand.max(crate::state::MIN_CHARGE) * reservations;
-        if queued > bound {
+        // After a kill, `drain_after_loss` queues what the dead transport holds, unbounded.
+        if w.killed_at.is_none() && queued > bound {
             return Err(format!(
                 "{side:?}: {queued} body bytes queued > C + D × {reservations} = {bound}"
             ));
