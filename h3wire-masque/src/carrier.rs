@@ -25,7 +25,6 @@ const SETTINGS_WAIT_BYTES: usize = 64 * 1024;
 
 /// What a tunnel type accepts.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // `control` and `max_control` are used by IpTunnel
 pub(crate) struct Limits {
     /// The largest context-0 payload.
     pub(crate) max_payload: usize,
@@ -37,7 +36,6 @@ pub(crate) struct Limits {
 
 /// One item from a receive source, before the caller's policy.
 #[derive(Debug)]
-#[allow(dead_code)] // `Control` is used by IpTunnel
 pub(crate) enum Raw {
     /// A context-0 payload within the limit.
     Payload(Bytes),
@@ -160,7 +158,6 @@ impl Tx {
     /// Write an already framed capsule (type, length, value) as is. One
     /// `TunnelSend::send` call takes the `Bytes` whole or not at all, so a cancelled send
     /// never leaves half a capsule on the stream.
-    #[allow(dead_code)] // used by IpTunnel
     pub(crate) async fn send_capsule(&mut self, capsule: Bytes) -> Result<(), TxError> {
         if self.finished {
             return Err(TxError::Closed);

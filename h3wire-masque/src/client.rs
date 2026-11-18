@@ -104,7 +104,7 @@ where
 
 /// A 2xx that cannot start a capsule-protocol tunnel (RFC 9297 section 3.2, RFC 9114
 /// section 4.1.2).
-fn malformed(status: StatusCode, h: &HeaderMap) -> bool {
+pub(crate) fn malformed(status: StatusCode, h: &HeaderMap) -> bool {
     matches!(status.as_u16(), 204..=206) || crate::forbidden(h)
 }
 
