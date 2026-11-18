@@ -3,6 +3,7 @@
 //! MASQUE CONNECT-IP (RFC 9484): IP tunnelling over HTTP/3.
 
 mod capsule;
+mod policy;
 mod prefix;
 mod template;
 
@@ -11,5 +12,6 @@ pub use capsule::{
     RequestedAddress, RouteError, decode_address_assign, decode_address_request, decode_routes,
     encode_address_assign, encode_address_request, encode_routes,
 };
+pub use policy::{DropReason, Drops, Policy, Rules};
 pub use prefix::{IpPrefix, IpRange, PrefixError};
 pub use template::{IpTemplate, Scope, ScopeTarget};
