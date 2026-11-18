@@ -3,15 +3,18 @@
 #![no_main]
 
 use bytes::BytesMut;
+use h3wire_masque::capsule::CapsuleError;
 use h3wire_masque::ip::{
-    ADDRESS_ASSIGN, ADDRESS_REQUEST, ROUTE_ADVERTISEMENT, decode_address_assign,
+    ADDRESS_ASSIGN, ADDRESS_REQUEST, ROUTE_ADVERTISEMENT, RouteError, decode_address_assign,
     decode_address_request, decode_routes, encode_address_assign, encode_address_request,
     encode_routes,
 };
 use libfuzzer_sys::fuzz_target;
 
 // First byte picks the capsule type (mod 3), the rest is its value. No panic; whatever
-// decodes must re-encode, and decode again to the same list.
+// decodes must re-encode, and decode again to the same list. The decoders take values of
+// any length (the carrier bounds received capsules), the encoders refuse values over
+// `MAX_CONTROL_CAPSULE`: that `TooLarge` is expected, any other encoder error is not.
 fuzz_target!(|data: &[u8]| {
     let Some((&k, value)) = data.split_first() else {
         return;
@@ -32,7 +35,10 @@ fuzz_target!(|data: &[u8]| {
             let Ok(list) = decode_address_assign(value) else {
                 return;
             };
-            encode_address_assign(&list, &mut out).unwrap();
+            match encode_address_assign(&list, &mut out) {
+                Err(CapsuleError::TooLarge) => return,
+                r => r.unwrap(),
+            }
             assert_eq!(
                 decode_address_assign(&body(&out, ADDRESS_ASSIGN)).unwrap(),
                 list
@@ -42,7 +48,10 @@ fuzz_target!(|data: &[u8]| {
             let Ok(list) = decode_address_request(value) else {
                 return;
             };
-            encode_address_request(&list, &mut out).unwrap();
+            match encode_address_request(&list, &mut out) {
+                Err(CapsuleError::TooLarge) => return,
+                r => r.unwrap(),
+            }
             assert_eq!(
                 decode_address_request(&body(&out, ADDRESS_REQUEST)).unwrap(),
                 list
@@ -52,7 +61,10 @@ fuzz_target!(|data: &[u8]| {
             let Ok(list) = decode_routes(value) else {
                 return;
             };
-            encode_routes(&list, &mut out).unwrap();
+            match encode_routes(&list, &mut out) {
+                Err(RouteError::Capsule(CapsuleError::TooLarge)) => return,
+                r => r.unwrap(),
+            }
             assert_eq!(
                 decode_routes(&body(&out, ROUTE_ADVERTISEMENT)).unwrap(),
                 list

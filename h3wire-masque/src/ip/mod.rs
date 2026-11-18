@@ -49,12 +49,20 @@
 //! section 11 allows a proxy to forward ICMP on a shared address only to the client whose
 //! scope matches the quoted packet.
 //!
+//! A non-first fragment carries no ICMP header and no quotation, so the policy judges it
+//! by its addresses and the request scope only. A proxy that shares an address between
+//! clients and forwards ICMP must therefore drop non-first ICMP fragments, or reassemble
+//! before the check: only the first fragment holds the invoking packet that section 11
+//! requires it to inspect.
+//!
 //! # Other points to know
 //!
 //! - Offers must be accepted before they count (above).
-//! - Packets in `fe80::/10` or to `ff02::/16` pass the policy, so that link-local probes
-//!   and replies work. The application must not forward them beyond the tunnel (RFC 9484
-//!   section 7.2).
+//! - Packets to `fe80::/10` or `ff02::/16`, and packets from a link-local source to an
+//!   assigned address, pass the destination and target checks, and a link-local source
+//!   passes the source check for them, so that link-local probes and replies work; the
+//!   `ipproto` scope still applies. The application must not forward them beyond the
+//!   tunnel (RFC 9484 section 7.2).
 //! - Every [`IpEvent::AddressRequest`] is the application's to answer with
 //!   [`assign`](IpTunnel::assign): one entry per request ID, either an assignment or an
 //!   [`AssignedAddress::rejection`]. `assign` replaces the full list, so repeat the
@@ -86,6 +94,10 @@
 //! - Under [`Policy::Unchecked`], source address validation is the application's
 //!   (section 11 requires following BCP 38 wherever an endpoint knows the prefixes its
 //!   peer may send from).
+//! - The ECN and DSCP rules (sections 10.2 and 10.3: Not-ECT outside congestion control,
+//!   no copying of the inner DSCP, no coalescing of differently marked packets) bind the
+//!   QUIC sender's outer packets and IP headers, which this library never touches: they
+//!   are the transport's.
 //!
 //! A client opens a tunnel, asks for an address and accepts what the proxy offers:
 //!
@@ -98,7 +110,7 @@
 //! async fn client(send: &mut SendRequest<Empty<Bytes>>) -> Result<(), Box<dyn std::error::Error>> {
 //!     let template = IpTemplate::parse("https://proxy.example/vpn/{target}/{ipproto}/")?;
 //!     let mut tunnel = ip::client::connect(send, &template, &Scope::ANY).await?;
-//!     // 0.0.0.0/32: any IPv4 address.
+//!     // 0.0.0.0/32: one IPv4 address, no preference (RFC 9484 section 4.7.2).
 //!     tunnel.request(&[IpPrefix::new([0; 4].into(), 32)?]).await?;
 //!     while let Some(event) = tunnel.recv().await? {
 //!         match event {
@@ -109,6 +121,7 @@
 //!             IpEvent::Routes(routes) => tunnel.accept_routes(&routes)?,
 //!             // Hand the packet to the TUN device.
 //!             IpEvent::Packet(_) => {}
+//!             // A real client must answer `IpEvent::AddressRequest` with `assign` (4.7.2).
 //!             _ => {}
 //!         }
 //!     }

@@ -27,7 +27,7 @@ use std::future::{Future, poll_fn};
 /// The largest UDP payload a context-ID-0 tunnel carries (RFC 9298 section 5).
 pub const MAX_UDP_PAYLOAD: usize = 65_527;
 
-/// How a tunnel sends UDP payloads.
+/// How a tunnel sends its payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Carrier {
     /// HTTP Datagrams (RFC 9297 section 2).

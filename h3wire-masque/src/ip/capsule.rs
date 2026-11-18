@@ -134,7 +134,8 @@ fn encode_addresses(
     finish(ty, &v, out)
 }
 
-/// Append an ADDRESS_ASSIGN capsule. An empty list is legal.
+/// Append an ADDRESS_ASSIGN capsule. An empty list is legal. `TooLarge` if the value would
+/// exceed [`MAX_CONTROL_CAPSULE`].
 pub fn encode_address_assign(
     entries: &[AssignedAddress],
     out: &mut BytesMut,
@@ -146,7 +147,8 @@ pub fn encode_address_assign(
     )
 }
 
-/// Append an ADDRESS_REQUEST capsule; an empty list is `Malformed`.
+/// Append an ADDRESS_REQUEST capsule; an empty list is `Malformed`, and a value that
+/// would exceed [`MAX_CONTROL_CAPSULE`] is `TooLarge`.
 pub fn encode_address_request(
     entries: &[RequestedAddress],
     out: &mut BytesMut,
@@ -201,7 +203,8 @@ fn routes_valid(routes: &[IpRange]) -> bool {
 }
 
 /// Append a ROUTE_ADVERTISEMENT capsule, sorting `routes` into wire order first.
-/// `Overlap` if any two ranges overlap (see the module rules).
+/// `Overlap` if any two ranges overlap (see the module rules); `Capsule(TooLarge)` if the
+/// value would exceed [`MAX_CONTROL_CAPSULE`].
 pub fn encode_routes(routes: &[IpRange], out: &mut BytesMut) -> Result<(), RouteError> {
     let mut sorted = routes.to_vec();
     sorted.sort_by_key(sort_key);

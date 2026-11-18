@@ -15,8 +15,9 @@ The `ip` module tunnels IP packets (RFC 9484): `ip::client::connect` and
 `ADDRESS_ASSIGN`, `ADDRESS_REQUEST` and `ROUTE_ADVERTISEMENT` capsules. Spawn
 `IpPending::tunnel()` after returning the response. A non-2xx response is
 `ConnectError::Failed` with the status and headers (`Proxy-Status` included); the library
-aborts the request, as RFC 9484 sections 4.1 and 4.5 require. Its examples `ip-proxy` and `ip-client`
-(Linux, TUN device) are checked against connect-ip-go; the matrix is in
+aborts the request, as RFC 9484 sections 4.1 and 4.5 require. The crate's examples
+`ip-proxy` and `ip-client` (Linux, TUN device) are checked against connect-ip-go; the
+matrix is in
 [docs/interop.md](https://github.com/mqvpn/h3wire/blob/main/docs/interop.md).
 
 - **Policy.** By default every received packet is checked against the assigned addresses,
@@ -28,9 +29,14 @@ aborts the request, as RFC 9484 sections 4.1 and 4.5 require. Its examples `ip-p
 - **Shared addresses.** `check_outgoing` is an eligibility filter, not a tunnel selector.
   An application that shares addresses MUST run it on every candidate tunnel and MUST
   resolve several eligible tunnels itself (distinct addresses, bounded flow tracking, or
-  dropping the packet), never broadcast.
-- **Link-scoped packets** (`fe80::/10`, `ff02::/16`) pass the policy and must not be
-  forwarded beyond the tunnel.
+  dropping the packet), never broadcast. A non-first fragment carries no ICMP header and
+  no quotation, so the policy judges it by addresses and scope only: a proxy that shares
+  an address and forwards ICMP must drop non-first ICMP fragments or reassemble before the
+  check (section 11).
+- **Link-scoped packets.** Packets to `fe80::/10` or `ff02::/16`, and packets from a
+  link-local source to an assigned address, pass the destination and target checks (a
+  link-local source passes the source check for them), so link-local probes and replies
+  work; the `ipproto` scope still applies. They must not be forwarded beyond the tunnel.
 - **Address requests.** Answer every `IpEvent::AddressRequest` with `assign`, which sends
   the full list: repeat earlier assignments with request ID 0.
 - **IPv6 MTU.** Configure the transport so a 1,280-byte packet fits in a datagram (quinn:
@@ -51,6 +57,8 @@ aborts the request, as RFC 9484 sections 4.1 and 4.5 require. Its examples `ip-p
 - Hop-limit decrement on encapsulation, and ICMP error generation (Packet Too Big
   included), belong to the IP stack behind the tunnel (sections 7.2, 7.2.1, 10.1).
 - Under `Policy::Unchecked`, source address validation is the application's (section 11).
+- The ECN and DSCP rules (sections 10.2 and 10.3) bind the QUIC sender's outer packets and
+  IP headers, which this library never touches: they are the transport's.
 
 The [`ip` module documentation](https://docs.rs/h3wire-masque/latest/h3wire_masque/ip/)
 has a client snippet and the details.

@@ -336,6 +336,8 @@ mod linux {
         let test = async {
             if let Some(want) = &cfg.request {
                 correlation(&tx, want, &mut assigns).await?;
+                // Nothing reads later lists; the relay's sends are dropped from here on.
+                assigns.close();
             }
             testcase(cfg.testcase, cfg.server).await
         };
