@@ -190,6 +190,27 @@ impl Drop for Slot<'_> {
     }
 }
 
+/// The locked stream sender of [`TxShared::with_tunnel`]. Its drop, also in a panic,
+/// unlocks and then passes on the wake that waited.
+struct Held<'a> {
+    waiters: &'a Arc<Waiters>,
+    tunnel: Option<MutexGuard<'a, Option<TunnelSend>>>,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        let woken = {
+            let mut list = lock(&self.waiters.0);
+            list.held = false;
+            std::mem::take(&mut list.woken)
+        };
+        self.tunnel = None;
+        if woken {
+            self.waiters.wake_by_ref();
+        }
+    }
+}
+
 /// What [`Tx`] and its [`WeakTx`] share; every method takes `&self`, so tasks can send at
 /// once. Each payload or capsule goes out whole, in no promised order.
 #[derive(Debug)]
@@ -268,20 +289,16 @@ impl TxShared {
     /// Run `f` on the locked stream sender. One short step, never across an `.await`. No
     /// waiting send is woken until the lock is released, whatever `f` calls: a waker may
     /// poll its task at once, and that task locks here again.
+    // shortcut: wakers that are not ours (the receiver's in `abort`, the driver's) still
+    // run under the lock, which only an executor polling inside `wake` can notice, and
+    // quinn wakes under its own lock too; to lift it, never call h3wire-async locked.
     fn with_tunnel<R>(&self, f: impl FnOnce(&mut Option<TunnelSend>) -> R) -> R {
-        let mut tunnel = lock(&self.tunnel);
-        lock(&self.waiters.0).held = true;
-        let r = f(&mut tunnel);
-        let woken = {
-            let mut list = lock(&self.waiters.0);
-            list.held = false;
-            std::mem::take(&mut list.woken)
+        let mut held = Held {
+            waiters: &self.waiters,
+            tunnel: Some(lock(&self.tunnel)),
         };
-        drop(tunnel);
-        if woken {
-            self.waiters.wake_by_ref();
-        }
-        r
+        lock(&self.waiters.0).held = true;
+        f(held.tunnel.as_mut().expect("locked until the drop"))
     }
 
     /// Inside `with_tunnel`: nothing is sent from here on, and the sends waiting for
@@ -657,6 +674,33 @@ mod tests {
         assert!(lock(&w.0).woken);
         drop(a);
         assert_eq!(len(), 0);
+    }
+
+    #[test]
+    fn panic_under_the_lock_keeps_wakes_working() {
+        let tx = TxShared {
+            tunnel: Mutex::new(None),
+            dgrams: None,
+            closed: AtomicBool::new(false),
+            waiters: Arc::default(),
+        };
+        let mut slot = Slot {
+            waiters: &tx.waiters,
+            id: None,
+        };
+        slot.set(Waker::noop());
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tx.with_tunnel(|_| {
+                tx.waiters.wake_by_ref();
+                panic!("under the lock")
+            })
+        }));
+        assert!(caught.is_err());
+        // The wake that waited went out, and the next one does not wait.
+        assert!(lock(&tx.waiters.0).wakers.is_empty());
+        slot.set(Waker::noop());
+        tx.waiters.wake_by_ref();
+        assert!(lock(&tx.waiters.0).wakers.is_empty());
     }
 
     /// Everything `next` yields until it needs more bytes.
