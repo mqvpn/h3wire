@@ -235,4 +235,4 @@ pub use prefix::{IpPrefix, IpRange, PrefixError};
 #[doc(hidden)]
 pub use set::{AddrSet, RouteSet};
 pub use template::{IpTemplate, Scope, ScopeTarget};
-pub use tunnel::{IpError, IpEvent, IpReceiver, IpSender, IpTunnel, MAX_IP_PACKET};
+pub use tunnel::{IpError, IpEvent, IpPacketSender, IpReceiver, IpSender, IpTunnel, MAX_IP_PACKET};

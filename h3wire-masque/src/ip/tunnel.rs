@@ -10,7 +10,7 @@ use super::{
     encode_address_assign, encode_address_request, encode_routes,
 };
 use crate::capsule::CapsuleError;
-use crate::carrier::{self, Limits, Raw, Rx, Step, Tx, TxError};
+use crate::carrier::{self, Limits, Raw, Rx, Step, Tx, TxError, TxShared, WeakTx, lock};
 use crate::tunnel::Carrier;
 use bytes::{Bytes, BytesMut};
 use h3wire_async::core::H3Code;
@@ -20,7 +20,7 @@ use h3wire_async::{DatagramError, Error};
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 
 /// The largest IP packet a tunnel carries: a 40-byte IPv6 header and 65,535 bytes.
 pub const MAX_IP_PACKET: usize = 65_575;
@@ -115,11 +115,6 @@ const LIMITS: Limits = Limits {
     control: |ty| matches!(ty, ADDRESS_ASSIGN | ADDRESS_REQUEST | ROUTE_ADVERTISEMENT),
     max_control: MAX_CONTROL_CAPSULE,
 };
-
-/// Each lock is for one short step: never across an `.await` or while a future is polled.
-fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
-    state.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// Unstages when dropped uncommitted, so a cancelled or failed control send leaves the
 /// state as it was. Sound because assign and advertise take `&mut` on the one sender: at
@@ -265,9 +260,15 @@ impl IpTunnel {
         self.send.carrier()
     }
 
+    /// See [`IpSender::packet_sender`].
+    pub fn packet_sender(&self) -> IpPacketSender {
+        self.send.packet_sender()
+    }
+
     state_methods!();
 
-    /// The two halves.
+    /// The two halves. To send packets from more tasks, see
+    /// [`IpSender::packet_sender`].
     pub fn split(self) -> (IpSender, IpReceiver) {
         (self.send, self.recv)
     }
@@ -295,22 +296,15 @@ impl IpSender {
     /// `H3_DATAGRAM_ERROR` and returns `MtuTooSmall` (RFC 9484 section 7.2). Cancel-safe:
     /// a dropped pending send wrote nothing.
     pub async fn send(&mut self, packet: Bytes) -> Result<(), IpError> {
-        if !matches!(packet.first().map(|b| b >> 4), Some(4 | 6)) {
-            return Err(IpError::Malformed);
-        }
-        if packet.len() > MAX_IP_PACKET {
-            return Err(IpError::TooLarge);
-        }
-        let v6 = packet[0] >> 4 == 6;
-        match self.tx.send_payload(packet).await {
-            // RFC 9484 section 7.2: an IPv6 packet refused while 1280 cannot fit.
-            Err(TxError::Datagram(DatagramError::TooLarge))
-                if v6 && self.tx.datagram_cannot_fit(IPV6_MIN_MTU) =>
-            {
-                self.abort(H3Code::DATAGRAM_ERROR);
-                Err(IpError::MtuTooSmall)
-            }
-            r => Ok(r?),
+        send_packet(&self.tx, packet).await
+    }
+
+    /// A handle that sends packets on this tunnel from other tasks, while this sender
+    /// keeps the control capsules.
+    pub fn packet_sender(&self) -> IpPacketSender {
+        IpPacketSender {
+            tx: self.tx.downgrade(),
+            state: self.state.clone(),
         }
     }
 
@@ -387,6 +381,59 @@ impl IpSender {
     state_methods!();
 }
 
+/// [`IpSender::send`] for either kind of sender.
+async fn send_packet(tx: &TxShared, packet: Bytes) -> Result<(), IpError> {
+    if !matches!(packet.first().map(|b| b >> 4), Some(4 | 6)) {
+        return Err(IpError::Malformed);
+    }
+    if packet.len() > MAX_IP_PACKET {
+        return Err(IpError::TooLarge);
+    }
+    let v6 = packet[0] >> 4 == 6;
+    match tx.send_payload(packet).await {
+        // RFC 9484 section 7.2: an IPv6 packet refused while 1280 cannot fit.
+        Err(TxError::Datagram(DatagramError::TooLarge))
+            if v6 && tx.datagram_cannot_fit(IPV6_MIN_MTU) =>
+        {
+            tx.abort(H3Code::DATAGRAM_ERROR);
+            Err(IpError::MtuTooSmall)
+        }
+        r => Ok(r?),
+    }
+}
+
+/// Sends IP packets on an [`IpTunnel`] from any number of tasks: clones share the tunnel
+/// and `send` takes `&self`. Made by [`IpSender::packet_sender`]. Control capsules stay
+/// with the one `IpSender`.
+///
+/// A handle does not keep the tunnel open. Once the `IpSender` (or the `IpTunnel` holding
+/// it) is finished or dropped, `send` returns `Closed`.
+#[derive(Clone, Debug)]
+pub struct IpPacketSender {
+    tx: WeakTx,
+    state: Arc<Mutex<State>>,
+}
+
+impl IpPacketSender {
+    /// As [`IpSender::send`]. Each packet goes out whole. Packets sent at the same time,
+    /// through clones or through the `IpSender`, go out in no promised order, and on the
+    /// capsule carrier those waiting for stream credit are not served in turn.
+    pub async fn send(&self, packet: Bytes) -> Result<(), IpError> {
+        let tx = self.tx.upgrade().ok_or(IpError::Closed)?;
+        send_packet(&tx, packet).await
+    }
+
+    /// As [`IpSender::check_outgoing`].
+    pub fn check_outgoing(&self, packet: &[u8]) -> Result<(), DropReason> {
+        lock(&self.state).check_outgoing(packet)
+    }
+
+    /// As [`IpSender::max_payload`]; `None` also once the `IpSender` is gone.
+    pub fn max_payload(&self) -> Option<usize> {
+        self.tx.upgrade()?.max_payload(MAX_IP_PACKET)
+    }
+}
+
 /// The receiving half of an [`IpTunnel`].
 #[derive(Debug)]
 pub struct IpReceiver {
@@ -451,4 +498,5 @@ const _: () = {
     send_sync::<IpTunnel>();
     send_sync::<IpSender>();
     send_sync::<IpReceiver>();
+    send_sync::<IpPacketSender>();
 };

@@ -63,6 +63,13 @@ matrix is in
 The [`ip` module documentation](https://docs.rs/h3wire-masque/latest/h3wire_masque/ip/)
 has a client snippet and the details.
 
+## 0.2.2
+
+- New `ip::IpPacketSender`, from `IpTunnel::packet_sender` or `IpSender::packet_sender`: a
+  cloneable handle whose `send` takes `&self`, so several tasks send packets without a
+  mutex around the `IpSender`. Control capsules stay with the `IpSender`, and a handle
+  does not keep the tunnel open.
+
 ## 0.2.0
 
 - New `ip` module: CONNECT-IP (RFC 9484).

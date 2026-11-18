@@ -47,8 +47,8 @@ mod linux {
     use h3wire_async::rt::TokioExecutor;
     use h3wire_async::{BoxError, Builder};
     use h3wire_masque::ip::{
-        self, AssignedAddress, IpError, IpEvent, IpPrefix, IpRange, IpReceiver, IpSender,
-        IpTemplate, IpTunnel, MAX_IP_PACKET, RequestedAddress, Scope,
+        self, AssignedAddress, IpError, IpEvent, IpPacketSender, IpPrefix, IpRange, IpReceiver,
+        IpSender, IpTemplate, IpTunnel, MAX_IP_PACKET, RequestedAddress, Scope,
     };
     use http_body_util::Empty;
     use quinn::crypto::rustls::QuicClientConfig;
@@ -328,6 +328,9 @@ mod linux {
         eprintln!("{} up", tun.name());
 
         let (tx, mut rx) = tunnel.split();
+        // Packets go through their own handle; the mutex is for the control capsules,
+        // which the test and the relay both send.
+        let packets = tx.packet_sender();
         let tx = Mutex::new(tx);
         let (assigns_tx, mut assigns) = unbounded_channel();
         if cfg.request.is_none() {
@@ -343,7 +346,7 @@ mod linux {
         };
         tokio::select! {
             r = test => r,
-            () = relay(&tx, &mut rx, &tun, assigns_tx) => Err("the tunnel ended".into()),
+            () = relay(&tx, &packets, &mut rx, &tun, assigns_tx) => Err("the tunnel ended".into()),
         }
     }
 
@@ -400,6 +403,7 @@ mod linux {
     /// one waiting for credit never stops the other.
     async fn relay(
         tx: &Mutex<IpSender>,
+        packets: &IpPacketSender,
         rx: &mut IpReceiver,
         tun: &Tun,
         assigns: UnboundedSender<Vec<AssignedAddress>>,
@@ -411,12 +415,11 @@ mod linux {
                     Ok(p) => p.len(),
                     Err(e) => return eprintln!("TUN device: {e}"),
                 };
-                let mut tx = tx.lock().await;
                 // What the proxy's rules would refuse (router solicitations, say) is dropped.
-                if tx.check_outgoing(&buf[..n]).is_err() {
+                if packets.check_outgoing(&buf[..n]).is_err() {
                     continue;
                 }
-                match tx.send(Bytes::copy_from_slice(&buf[..n])).await {
+                match packets.send(Bytes::copy_from_slice(&buf[..n])).await {
                     // Too large for a datagram: a loss.
                     Ok(()) | Err(IpError::TooLarge) => {}
                     Err(e) => return eprintln!("tunnel: {e}"),
