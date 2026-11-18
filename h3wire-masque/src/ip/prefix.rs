@@ -33,7 +33,7 @@ impl fmt::Display for PrefixError {
 impl std::error::Error for PrefixError {}
 
 /// Address width in bits and numeric value; the family is part of the width.
-fn num(addr: IpAddr) -> (u8, u128) {
+pub(super) fn num(addr: IpAddr) -> (u8, u128) {
     match addr {
         IpAddr::V4(a) => (32, u32::from(a).into()),
         IpAddr::V6(a) => (128, a.into()),
