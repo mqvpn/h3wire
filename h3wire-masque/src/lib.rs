@@ -71,6 +71,7 @@
 pub mod capsule;
 mod carrier;
 pub mod client;
+pub mod ip;
 pub mod server;
 pub mod template;
 pub mod tunnel;
