@@ -267,3 +267,66 @@ async fn path_shrink_detected_by_next_refusal() {
     })
     .await
 }
+
+/// A datagram limit that is known but leaves no room after the context ID: `max_payload`
+/// is `None`, yet the endpoint knows 1280 bytes cannot fit (RFC 9484 section 7.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_refusal_with_no_room_aborts() {
+    with_timeout(async {
+        const S0: StreamId = StreamId(0);
+        let (net, cc, sc) = MockNet::pair();
+        net.set_max_datagram_size(Side::Client, Some(1500));
+        let (mut send, conn) = Builder::new()
+            .handshake::<_, BoxBody, _>(cc, TokioExecutor)
+            .await
+            .unwrap();
+        let _client = tokio::spawn(conn);
+        let mut cfg = Config::default();
+        cfg.enable_connect_protocol = true;
+        cfg.h3_datagram = true;
+        let mut peer = CorePeer::new(Role::Server, cfg, sc);
+        // Dropping the last `SendRequest` would close the connection and race the reset.
+        let _keep = send.clone();
+        let connect = tokio::spawn(async move {
+            ip::client::connect(&mut send, &ip_template(), &Scope::ANY).await
+        });
+        peer.run_until(|p| !p.headers(S0).is_empty()).await;
+        peer.send_headers(S0, &[(":status", "200"), ("capsule-protocol", "?1")], false)
+            .unwrap();
+        let mut c = drive_mock(&mut peer, connect).await.unwrap().unwrap();
+        assert_eq!(c.carrier(), Carrier::Datagram);
+        until(&mut peer, |_| c.max_payload().is_some()).await;
+
+        // One byte: the quarter stream ID fits, the context ID does not.
+        net.set_max_datagram_size(Side::Client, Some(1));
+        // The driver learns the new limit on its next pass, which a send triggers. An IPv4
+        // refusal is `TooLarge` and leaves the tunnel open.
+        let mut refused = false;
+        for _ in 0..50 {
+            match c.send(v4(100)).await {
+                Ok(()) => drive_mock(&mut peer, tokio::time::sleep(Duration::from_millis(5))).await,
+                Err(IpError::TooLarge) => {
+                    refused = true;
+                    break;
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        assert!(refused, "no IPv4 send was refused");
+        assert_eq!(c.max_payload(), None);
+        let r = c.send(v6(100)).await;
+        assert!(matches!(r, Err(IpError::MtuTooSmall)), "{r:?}");
+        until(&mut peer, |p| {
+            p.trace().iter().any(|o| match o {
+                PeerObs::Reset { stream, code } => *stream == S0 && *code == DG.0,
+                PeerObs::Event(Event::StreamAborted { stream, code, .. })
+                | PeerObs::Event(Event::SendStopped { stream, code }) => {
+                    *stream == S0 && *code == DG
+                }
+                _ => false,
+            })
+        })
+        .await;
+    })
+    .await
+}

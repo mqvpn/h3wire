@@ -61,9 +61,9 @@
 //!   addresses assigned earlier, with request ID 0.
 //! - IPv6 needs a tunnel MTU of at least 1,280 bytes. With the datagram carrier, set the
 //!   transport's initial MTU so that such a packet fits (quinn:
-//!   `TransportConfig::initial_mtu(1350)`). If an IPv6 send is refused while
-//!   [`max_payload`](IpTunnel::max_payload) is below 1,280, the tunnel aborts the stream
-//!   with `H3_DATAGRAM_ERROR` and the send returns [`IpError::MtuTooSmall`].
+//!   `TransportConfig::initial_mtu(1350)`). If an IPv6 send is refused while a 1,280-byte
+//!   packet does not fit in a datagram (the transport's limit is known), the tunnel aborts
+//!   the stream with `H3_DATAGRAM_ERROR` and the send returns [`IpError::MtuTooSmall`].
 //! - A [`ScopeTarget::Host`] target must be resolved by the application before the
 //!   response is returned; the library does not resolve names.
 //! - Return [`IpPending::response`](server::IpPending::response) first, then spawn

@@ -187,6 +187,13 @@ impl Tx {
         }
     }
 
+    /// Whether the datagram limit is known and too small for a payload of `n` bytes plus
+    /// the context ID byte; `false` for the capsule carrier or an unknown limit.
+    pub(crate) fn datagram_cannot_fit(&self, n: usize) -> bool {
+        let limit = self.dgrams.as_ref().and_then(DatagramSender::max_payload);
+        limit.is_some_and(|m| m <= n)
+    }
+
     /// The carrier chosen at open.
     pub(crate) fn carrier(&self) -> Carrier {
         match self.dgrams {

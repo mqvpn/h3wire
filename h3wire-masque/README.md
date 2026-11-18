@@ -34,8 +34,8 @@ aborts the request, as RFC 9484 sections 4.1 and 4.5 require. Its examples `ip-p
 - **Address requests.** Answer every `IpEvent::AddressRequest` with `assign`, which sends
   the full list: repeat earlier assignments with request ID 0.
 - **IPv6 MTU.** Configure the transport so a 1,280-byte packet fits in a datagram (quinn:
-  `initial_mtu(1350)`). An IPv6 send refused while `max_payload()` is below 1,280 aborts the
-  stream with `H3_DATAGRAM_ERROR` and returns `MtuTooSmall`.
+  `initial_mtu(1350)`). An IPv6 send refused while a 1,280-byte packet does not fit in a
+  datagram aborts the stream with `H3_DATAGRAM_ERROR` and returns `MtuTooSmall`.
 - **Host targets** are resolved by the application before the response.
 
 ### RFC 9484 duties left to the application
