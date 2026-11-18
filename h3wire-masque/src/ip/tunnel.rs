@@ -6,10 +6,10 @@
 //! counters.
 
 use super::{
-    ADDRESS_ASSIGN, ADDRESS_REQUEST, AssignedAddress, DropReason, Drops, IpPrefix, IpRange,
-    MAX_CONTROL_CAPSULE, Policy, ROUTE_ADVERTISEMENT, RequestedAddress, RouteError, Rules, Scope,
-    decode_address_assign, decode_address_request, decode_routes, encode_address_assign,
-    encode_address_request, encode_routes,
+    ADDRESS_ASSIGN, ADDRESS_REQUEST, AddrSet, AssignedAddress, DropReason, Drops, IpPrefix,
+    IpRange, MAX_CONTROL_CAPSULE, Policy, ROUTE_ADVERTISEMENT, RequestedAddress, RouteError,
+    RouteSet, Rules, Scope, decode_address_assign, decode_address_request, decode_routes,
+    encode_address_assign, encode_address_request, encode_routes,
 };
 use crate::capsule::CapsuleError;
 use crate::carrier::{self, Limits, Raw, Rx, Step, Tx, TxError};
@@ -466,18 +466,18 @@ pub(crate) struct State {
     proxy: bool,
     policy: Policy,
     /// *A*: what I assigned to the peer.
-    assigned: Vec<IpPrefix>,
+    assigned: AddrSet,
     /// *R*: what I advertised.
-    routes: Vec<IpRange>,
-    /// Staged by a send in flight; receive-only until committed.
-    staged_assigned: Vec<IpPrefix>,
-    staged_routes: Vec<IpRange>,
+    routes: RouteSet,
+    /// *A* and *R* plus the list of a send in flight; receive-only until committed.
+    staged_assigned: Option<AddrSet>,
+    staged_routes: Option<RouteSet>,
     /// The peer's latest offers.
-    offered_assigned: Vec<IpPrefix>,
-    offered_routes: Vec<IpRange>,
+    offered_assigned: AddrSet,
+    offered_routes: RouteSet,
     /// *A'* and *R'*: the offers I accepted.
-    peer_assigned: Vec<IpPrefix>,
-    peer_routes: Vec<IpRange>,
+    peer_assigned: AddrSet,
+    peer_routes: RouteSet,
     pending: BTreeSet<NonZeroU64>,
     last_request_id: u64,
     drops: Drops,
@@ -498,14 +498,14 @@ impl State {
             scope,
             proxy,
             policy: Policy::default(),
-            assigned: Vec::new(),
-            routes: Vec::new(),
-            staged_assigned: Vec::new(),
-            staged_routes: Vec::new(),
-            offered_assigned: Vec::new(),
-            offered_routes: Vec::new(),
-            peer_assigned: Vec::new(),
-            peer_routes: Vec::new(),
+            assigned: AddrSet::default(),
+            routes: RouteSet::default(),
+            staged_assigned: None,
+            staged_routes: None,
+            offered_assigned: AddrSet::default(),
+            offered_routes: RouteSet::default(),
+            peer_assigned: AddrSet::default(),
+            peer_routes: RouteSet::default(),
             pending: BTreeSet::new(),
             last_request_id: 0,
             drops: Drops::default(),
@@ -532,7 +532,7 @@ impl State {
         self.drops.malformed += 1;
     }
 
-    fn rules<'a>(&'a self, assigned: &'a [IpPrefix], routes: &'a [IpRange]) -> Rules<'a> {
+    fn rules<'a>(&'a self, assigned: &'a AddrSet, routes: &'a RouteSet) -> Rules<'a> {
         Rules {
             assigned,
             routes,
@@ -547,14 +547,10 @@ impl State {
     /// Judges a received packet with *A* and *R* widened by the staged entries; counts a
     /// drop and returns `false`.
     pub(crate) fn on_payload(&mut self, packet: &[u8]) -> bool {
-        let (a, r);
-        let rules = if self.staged_assigned.is_empty() && self.staged_routes.is_empty() {
-            self.rules(&self.assigned, &self.routes)
-        } else {
-            a = [&self.assigned[..], &self.staged_assigned].concat();
-            r = [&self.routes[..], &self.staged_routes].concat();
-            self.rules(&a, &r)
-        };
+        let rules = self.rules(
+            self.staged_assigned.as_ref().unwrap_or(&self.assigned),
+            self.staged_routes.as_ref().unwrap_or(&self.routes),
+        );
         let Err(why) = rules.incoming(packet) else {
             return true;
         };
@@ -581,10 +577,9 @@ impl State {
         match ty {
             ADDRESS_ASSIGN => {
                 let entries = decode_address_assign(value).map_err(bad)?;
-                self.offered_assigned = prefixes(&entries);
+                self.offered_assigned = AddrSet::new(prefixes(&entries));
                 let offered = &self.offered_assigned;
-                self.peer_assigned
-                    .retain(|a| offered.iter().any(|o| o.covers(a)));
+                self.peer_assigned.retain(|a| offered.covers(a));
                 Ok(IpEvent::AddressAssign(entries))
             }
             ADDRESS_REQUEST => {
@@ -597,10 +592,9 @@ impl State {
             }
             ROUTE_ADVERTISEMENT => {
                 let routes = decode_routes(value).map_err(bad)?;
-                self.offered_routes = routes.clone();
+                self.offered_routes = RouteSet::new(routes.clone());
                 let offered = &self.offered_routes;
-                self.peer_routes
-                    .retain(|a| offered.iter().any(|o| o.covers(a)));
+                self.peer_routes.retain(|a| offered.covers(a));
                 Ok(IpEvent::Routes(routes))
             }
             _ => Err(H3Code::MESSAGE_ERROR),
@@ -620,29 +614,33 @@ impl State {
     }
 
     pub(crate) fn stage_assign(&mut self, entries: &[AssignedAddress]) {
-        self.staged_assigned = prefixes(entries);
+        let mut all = self.assigned.items().to_vec();
+        all.extend(prefixes(entries));
+        self.staged_assigned = Some(AddrSet::new(all));
     }
 
     pub(crate) fn commit_assign(&mut self, entries: &[AssignedAddress]) {
-        self.assigned = prefixes(entries);
-        self.staged_assigned.clear();
+        self.assigned = AddrSet::new(prefixes(entries));
+        self.staged_assigned = None;
         for n in entries.iter().filter_map(|e| NonZeroU64::new(e.request_id)) {
             self.pending.remove(&n);
         }
     }
 
     pub(crate) fn stage_advertise(&mut self, routes: &[IpRange]) {
-        self.staged_routes = routes.to_vec();
+        let mut all = self.routes.items().to_vec();
+        all.extend(routes);
+        self.staged_routes = Some(RouteSet::new(all));
     }
 
     pub(crate) fn commit_advertise(&mut self, routes: &[IpRange]) {
-        self.routes = routes.to_vec();
-        self.staged_routes.clear();
+        self.routes = RouteSet::new(routes.to_vec());
+        self.staged_routes = None;
     }
 
     pub(crate) fn unstage(&mut self) {
-        self.staged_assigned.clear();
-        self.staged_routes.clear();
+        self.staged_assigned = None;
+        self.staged_routes = None;
     }
 
     pub(crate) fn next_request_ids(&mut self, n: usize) -> Vec<NonZeroU64> {
@@ -659,20 +657,18 @@ impl State {
     }
 
     pub(crate) fn accept_assigned(&mut self, items: &[IpPrefix]) -> Result<(), IpError> {
-        let offered = &self.offered_assigned;
-        if !items.iter().all(|i| offered.iter().any(|o| o.covers(i))) {
+        if !items.iter().all(|i| self.offered_assigned.covers(i)) {
             return Err(IpError::NotOffered);
         }
-        self.peer_assigned = items.to_vec();
+        self.peer_assigned = AddrSet::new(items.to_vec());
         Ok(())
     }
 
     pub(crate) fn accept_routes(&mut self, items: &[IpRange]) -> Result<(), IpError> {
-        let offered = &self.offered_routes;
-        if !items.iter().all(|i| offered.iter().any(|o| o.covers(i))) {
+        if !items.iter().all(|i| self.offered_routes.covers(i)) {
             return Err(IpError::NotOffered);
         }
-        self.peer_routes = items.to_vec();
+        self.peer_routes = RouteSet::new(items.to_vec());
         Ok(())
     }
 }
@@ -775,7 +771,7 @@ mod tests {
         s.check_assign(&reply).unwrap();
         s.commit_assign(&reply);
         assert_eq!(s.pending_requests(), []);
-        assert_eq!(s.assigned, [pfx("10.0.0.2/32")]);
+        assert_eq!(s.assigned.items(), [pfx("10.0.0.2/32")]);
     }
 
     #[test]
@@ -793,7 +789,7 @@ mod tests {
         let second = [asg(0, "10.0.0.2/32"), asg(1, "10.0.0.3/32")];
         s.check_assign(&second).unwrap();
         s.commit_assign(&second);
-        assert_eq!(s.assigned, [pfx("10.0.0.2/32"), pfx("10.0.0.3/32")]);
+        assert_eq!(s.assigned.items(), [pfx("10.0.0.2/32"), pfx("10.0.0.3/32")]);
         assert_eq!(s.pending_requests(), []);
     }
 
@@ -862,8 +858,8 @@ mod tests {
         for bad in [range("172.16.0.0/16", 0), range("172.16.0.0/12", 6)] {
             assert!(matches!(s.accept_routes(&[bad]), Err(IpError::NotOffered)));
         }
-        assert_eq!(s.peer_assigned, [pfx("10.1.0.1/32")]);
-        assert_eq!(s.peer_routes, [range("172.16.1.0/24", 6)]);
+        assert_eq!(s.peer_assigned.items(), [pfx("10.1.0.1/32")]);
+        assert_eq!(s.peer_routes.items(), [range("172.16.1.0/24", 6)]);
     }
 
     #[test]
@@ -873,10 +869,10 @@ mod tests {
             .unwrap();
         s.accept_assigned(&[pfx("10.1.0.0/25"), pfx("10.1.0.200/32")])
             .unwrap();
-        assert_eq!(s.peer_assigned.len(), 2);
+        assert_eq!(s.peer_assigned.items().len(), 2);
         // Replaced, not merged.
         s.accept_assigned(&[]).unwrap();
-        assert!(s.peer_assigned.is_empty());
+        assert!(s.peer_assigned.items().is_empty());
     }
 
     #[test]
@@ -888,7 +884,7 @@ mod tests {
             .unwrap();
         s.on_control(ADDRESS_ASSIGN, &assign_value(&both[..1]))
             .unwrap();
-        assert_eq!(s.peer_assigned, [pfx("10.1.0.1/32")]);
+        assert_eq!(s.peer_assigned.items(), [pfx("10.1.0.1/32")]);
 
         let routes = [range("172.16.0.0/16", 0), range("172.17.0.0/16", 0)];
         s.on_control(ROUTE_ADVERTISEMENT, &routes_value(&routes))
@@ -896,7 +892,7 @@ mod tests {
         s.accept_routes(&routes).unwrap();
         s.on_control(ROUTE_ADVERTISEMENT, &routes_value(&routes[1..]))
             .unwrap();
-        assert_eq!(s.peer_routes, [routes[1]]);
+        assert_eq!(s.peer_routes.items(), [routes[1]]);
     }
 
     #[test]
@@ -904,7 +900,7 @@ mod tests {
         let mut s = proxy();
         s.commit_assign(&[]);
         s.commit_advertise(&[]);
-        assert!(s.assigned.is_empty() && s.routes.is_empty());
+        assert!(s.assigned.items().is_empty() && s.routes.items().is_empty());
         assert!(!s.on_payload(&pkt("10.0.0.2", "192.0.2.1")));
 
         s.on_control(ADDRESS_ASSIGN, &assign_value(&[asg(0, "10.1.0.1/32")]))
@@ -914,7 +910,7 @@ mod tests {
             s.on_control(ADDRESS_ASSIGN, &assign_value(&[])),
             Ok(IpEvent::AddressAssign(vec![]))
         );
-        assert!(s.offered_assigned.is_empty() && s.peer_assigned.is_empty());
+        assert!(s.offered_assigned.items().is_empty() && s.peer_assigned.items().is_empty());
     }
 
     #[test]
@@ -934,7 +930,7 @@ mod tests {
         s.unstage();
         assert!(!s.on_payload(&new));
         assert!(s.on_payload(&old));
-        assert_eq!(s.assigned, [pfx("10.0.0.2/32")]);
+        assert_eq!(s.assigned.items(), [pfx("10.0.0.2/32")]);
 
         s.stage_assign(&[asg(0, "10.0.0.3/32")]);
         s.commit_assign(&[asg(0, "10.0.0.3/32")]);
@@ -961,6 +957,34 @@ mod tests {
     }
 
     #[test]
+    fn empty_and_repeated_stage() {
+        let mut s = proxy();
+        let old = pkt("10.0.0.2", "192.0.2.1");
+        let third = pkt("10.0.0.3", "192.0.2.1");
+        let fourth = pkt("10.0.0.4", "192.0.2.1");
+
+        // A withdrawal in flight keeps the old entries valid until it commits.
+        s.stage_assign(&[]);
+        s.stage_advertise(&[]);
+        assert!(s.on_payload(&old));
+        s.commit_assign(&[]);
+        assert!(!s.on_payload(&old));
+        s.commit_advertise(&[]);
+
+        // A later stage replaces the earlier one.
+        let mut s = proxy();
+        s.stage_assign(&[asg(0, "10.0.0.3/32")]);
+        s.stage_assign(&[asg(0, "10.0.0.4/32")]);
+        assert!(!s.on_payload(&third));
+        assert!(s.on_payload(&fourth));
+        assert!(s.on_payload(&old));
+        s.stage_advertise(&[range("192.0.3.0/24", 0)]);
+        s.stage_advertise(&[range("192.0.4.0/24", 0)]);
+        assert!(!s.on_payload(&pkt("10.0.0.2", "192.0.3.1")));
+        assert!(s.on_payload(&pkt("10.0.0.2", "192.0.4.1")));
+    }
+
+    #[test]
     fn rejection_reported_not_offered() {
         let mut s = State::new(Scope::ANY, false);
         let entries = [
@@ -971,7 +995,7 @@ mod tests {
             s.on_control(ADDRESS_ASSIGN, &assign_value(&entries)),
             Ok(IpEvent::AddressAssign(entries.to_vec()))
         );
-        assert_eq!(s.offered_assigned, [pfx("10.1.0.1/32")]);
+        assert_eq!(s.offered_assigned.items(), [pfx("10.1.0.1/32")]);
         assert!(matches!(
             s.accept_assigned(&[pfx("0.0.0.0/32")]),
             Err(IpError::NotOffered)

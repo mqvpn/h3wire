@@ -5,7 +5,9 @@
 mod packets;
 
 use DropReason::{Destination, Icmp, Malformed, Protocol, Scope as ScopeDrop, Source};
-use h3wire_masque::ip::{DropReason, IpPrefix, IpRange, Policy, Rules, Scope, ScopeTarget};
+use h3wire_masque::ip::{
+    AddrSet, DropReason, IpPrefix, IpRange, Policy, RouteSet, Rules, Scope, ScopeTarget,
+};
 use packets::*;
 use proptest::prelude::*;
 use proptest::sample::Index;
@@ -44,24 +46,29 @@ struct Set {
 }
 
 impl Set {
-    fn rules(&self) -> Rules<'_> {
-        Rules {
-            assigned: &self.assigned,
-            routes: &self.routes,
-            peer_assigned: &self.peer_assigned,
-            peer_routes: &self.peer_routes,
+    fn judge(&self, p: &[u8], incoming: bool) -> Result<(), DropReason> {
+        let rules = Rules {
+            assigned: &AddrSet::new(self.assigned.clone()),
+            routes: &RouteSet::new(self.routes.clone()),
+            peer_assigned: &AddrSet::new(self.peer_assigned.clone()),
+            peer_routes: &RouteSet::new(self.peer_routes.clone()),
             scope: &self.scope,
             proxy: self.proxy,
             policy: self.policy,
+        };
+        if incoming {
+            rules.incoming(p)
+        } else {
+            rules.outgoing(p)
         }
     }
 
     fn inc(&self, p: &[u8]) -> Result<(), DropReason> {
-        self.rules().incoming(p)
+        self.judge(p, true)
     }
 
     fn out(&self, p: &[u8]) -> Result<(), DropReason> {
-        self.rules().outgoing(p)
+        self.judge(p, false)
     }
 
     fn scoped(self, ipproto: Option<u8>) -> Self {
