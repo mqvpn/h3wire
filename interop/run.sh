@@ -8,8 +8,10 @@
 #   SKIP_BUILD=1 interop/run.sh   reuse the images already built
 #
 # Runs every `mandatory` row of interop/cells.tsv and h3spec against our server, and
-# writes target/interop-report.md (scratch files: target/interop/). Exits non-zero on a
-# mandatory failure, or on an h3spec failure not listed in interop/h3spec-allowlist.
+# writes target/interop-report.md (scratch files: target/interop/). Then runs the
+# CONNECT-IP cells (interop/connect-ip/run.sh), which append their section. Exits non-zero
+# on a mandatory failure, a CONNECT-IP failure, or an h3spec failure not listed in
+# interop/h3spec-allowlist.
 #
 # A cell's command runs as `sh -ec` in the image of its client side (peers image for
 # peer->h3wire, h3wire image for h3wire->peer) and passes when it exits 0. A
@@ -212,4 +214,8 @@ total=$((SECONDS - start))
 } >"$report"
 echo "wrote $report (${total} s)"
 if [ -n "$h3spec_problem" ]; then echo "h3spec check failed: $h3spec_problem" >&2; fi
-[ "$mandatory_failed" = 0 ] && [ "$h3spec_new" = 0 ] && [ -z "$h3spec_problem" ]
+# CONNECT-IP cells against connect-ip-go: they append their own section to the report.
+connect_ip=0
+interop/connect-ip/run.sh || connect_ip=1
+[ "$mandatory_failed" = 0 ] && [ "$h3spec_new" = 0 ] && [ -z "$h3spec_problem" ] \
+    && [ "$connect_ip" = 0 ]

@@ -1,0 +1,146 @@
+connect-ip-go integration/ changes for interop/connect-ip/run.sh (docs/interop.md).
+Applied with `git apply` on the pinned tag. The library, the docker-compose files and
+the server are unchanged; so is the protocol behaviour of the client and the proxy
+except for the address requests below.
+
+1. client: with REQUEST_ADDRS (comma-separated prefixes, at least two), after the tunnel
+   is up it requests them with Conn.RequestAddresses, reads the next address assignment
+   (Conn.ReceiveAddressAssignment, 10 s) and requires the first request ID assigned with
+   the requested prefix and the second rejected; it prints
+   `address-request: ok ids=<a>,<b>` and runs TESTCASE, and exits non-zero otherwise.
+   The stock client never sends an ADDRESS_REQUEST, so the correlation cell needs it.
+2. proxy: answers every ADDRESS_REQUEST (Conn.ReceiveAddressRequest, AddressRequest.Respond)
+   by the rule of h3wire's ip-proxy: ASSIGN_ADDR if the requested prefix is its host
+   prefix or the all-zero address of its family, a rejection otherwise; ASSIGN_ADDR is
+   added with request ID 0 when no entry got it, so the assignment stays the full list.
+   The stock proxy assigns only unsolicited and leaves requests unanswered, though
+   RFC 9484 section 4.7.2 says each Requested Address SHALL get one (rfc9484.txt line 658).
+
+diff --git a/integration/client/client.go b/integration/client/client.go
+index f8dc51a..a3dec2c 100644
+--- a/integration/client/client.go
++++ b/integration/client/client.go
+@@ -12,6 +12,7 @@ import (
+ 	"os"
+ 	"os/exec"
+ 	"strconv"
++	"strings"
+ 	"syscall"
+ 	"time"
+ 
+@@ -53,6 +54,12 @@ func main() {
+ 	log.Printf("started tcpdump on TUN device: %s in the background", dev.Name())
+ 	go proxy(ipconn, dev)
+ 
++	if v := os.Getenv("REQUEST_ADDRS"); v != "" {
++		if err := runAddressRequest(ipconn, v); err != nil {
++			log.Fatalf("address-request: %v", err)
++		}
++	}
++
+ 	switch os.Getenv("TESTCASE") {
+ 	case "ping":
+ 		if err := runPingTest(serverAddr, 50); err != nil {
+@@ -249,3 +256,46 @@ func ipForURL(addr netip.Addr) string {
+ 	}
+ 	return fmt.Sprintf("[%s]", addr)
+ }
++
++// runAddressRequest requests the comma-separated prefixes in v and requires the next
++// address assignment to assign the first (with the requested prefix) and reject the second.
++func runAddressRequest(ipconn *connectip.Conn, v string) error {
++	var prefixes []netip.Prefix
++	for _, s := range strings.Split(v, ",") {
++		p, err := netip.ParsePrefix(s)
++		if err != nil {
++			return fmt.Errorf("REQUEST_ADDRS: %w", err)
++		}
++		prefixes = append(prefixes, p)
++	}
++	if len(prefixes) < 2 {
++		return errors.New("REQUEST_ADDRS: at least two prefixes")
++	}
++	ids, err := ipconn.RequestAddresses(prefixes)
++	if err != nil {
++		return err
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	assigned, err := ipconn.ReceiveAddressAssignment(ctx)
++	if err != nil {
++		return fmt.Errorf("no answer: %w", err)
++	}
++	find := func(id connectip.AddressRequestID) *connectip.AssignedAddress {
++		for i := range assigned {
++			if assigned[i].RequestID == id {
++				return &assigned[i]
++			}
++		}
++		return nil
++	}
++	a, b := find(ids[0]), find(ids[1])
++	if a == nil || b == nil {
++		return fmt.Errorf("assignment %v does not answer requests %d and %d", assigned, ids[0], ids[1])
++	}
++	if a.Rejected() || a.IPPrefix != prefixes[0] || !b.Rejected() {
++		return fmt.Errorf("unexpected answer %v, %v", *a, *b)
++	}
++	fmt.Printf("address-request: ok ids=%d,%d\n", ids[0], ids[1])
++	return nil
++}
+diff --git a/integration/proxy/proxy.go b/integration/proxy/proxy.go
+index dbcfda9..035d12d 100644
+--- a/integration/proxy/proxy.go
++++ b/integration/proxy/proxy.go
+@@ -3,6 +3,7 @@
+ package main
+ 
+ import (
++	"context"
+ 	"crypto/tls"
+ 	"errors"
+ 	"fmt"
+@@ -219,6 +220,8 @@ func handleConn(conn *connectip.Conn, addr netip.Addr, route netip.Prefix, ipPro
+ 		return fmt.Errorf("failed to advertise route: %w", err)
+ 	}
+ 
++	go answerAddressRequests(conn, addr)
++
+ 	errChan := make(chan error, 2)
+ 	go func() {
+ 		for {
+@@ -264,3 +267,34 @@ func handleConn(conn *connectip.Conn, addr netip.Addr, route netip.Prefix, ipPro
+ 	<-errChan // wait for the other goroutine to finish
+ 	return err
+ }
++
++// answerAddressRequests answers each of the client's address requests until the connection
++// closes, by the rule of h3wire's ip-proxy: a request gets addr if it asks for exactly that
++// address or for any address of its family (all-zero), every other one a rejection. addr
++// is in the answer either way, since an assignment replaces the previous one.
++func answerAddressRequests(conn *connectip.Conn, addr netip.Addr) {
++	host := netip.PrefixFrom(addr, addr.BitLen())
++	for {
++		req, err := conn.ReceiveAddressRequest(context.Background())
++		if err != nil {
++			return
++		}
++		assignments := make([]netip.Prefix, len(req.Prefixes))
++		var additional []netip.Prefix
++		assigned := false
++		for i, p := range req.Prefixes {
++			if p == host || (p.Addr().IsUnspecified() && p.Addr().Is4() == addr.Is4()) {
++				assignments[i] = host
++				assigned = true
++			}
++		}
++		if !assigned {
++			additional = []netip.Prefix{host}
++		}
++		if err := req.Respond(assignments, additional); err != nil {
++			log.Printf("failed to answer address request: %v", err)
++			return
++		}
++		log.Printf("answered address request %v with %v (additional %v)", req.Prefixes, assignments, additional)
++	}
++}

@@ -12,11 +12,13 @@ interop/run.sh               # builds both images, then runs the matrix and h3sp
 SKIP_BUILD=1 interop/run.sh  # reuses the images
 ```
 
-It writes `target/interop-report.md` and exits non-zero on any mandatory failure, or on
-any h3spec failure not in `interop/h3spec-allowlist`. Per-cell logs go to
-`target/interop/out/<cell>.log`, the h3spec output to `target/interop/h3spec.txt`.
-The run takes about 15 s once the images exist. A cold build of the images takes a few
-minutes, mostly BoringSSL and quiche.
+It writes `target/interop-report.md` and exits non-zero on any mandatory failure
+(CONNECT-IP cells included), or on any h3spec failure not in `interop/h3spec-allowlist`.
+Per-cell logs go to `target/interop/out/<cell>.log`, the h3spec output to
+`target/interop/h3spec.txt`. The run takes about 15 s once the images exist, plus one to
+two minutes for the CONNECT-IP cells (connect-ip-go's clone, Go build and images
+included; the report's run time does not count them). A cold build of the images takes
+a few minutes, mostly BoringSSL and quiche.
 
 Files in `interop/`:
 
@@ -28,6 +30,8 @@ Files in `interop/`:
   `Dockerfile.h3wire` builds our examples.
 - `masque-go.patch` is the one change to masque-go's `cmd/client` the harness needs
   (see [MASQUE](#masque)).
+- `connect-ip/` runs the CONNECT-IP cells against connect-ip-go (see
+  [CONNECT-IP](#connect-ip)); `interop/run.sh` calls its `run.sh` after the h3spec run.
 - `cells.tsv` is the matrix: `capability  peer  version  direction  command  status`.
   A `mandatory` cell runs its exact command; an `unsupported-by-peer-tooling` cell
   records in its command column why no command exists.
@@ -188,6 +192,78 @@ and the tunnelled connection closed cleanly at our server.
 Observed: masque-go's client closes its connection to the proxy with application code
 0, not `H3_NO_ERROR`, so our proxy logs that connection as `closed with error:
 transport error (peer closed with 0x0)`. The cell does not check the proxy's log.
+
+## CONNECT-IP
+
+CONNECT-IP (RFC 9484) against [connect-ip-go](https://github.com/quic-go/connect-ip-go)
+at the tag pinned in `versions.env` (`CONNECT_IP_GO_TAG`, `CONNECT_IP_GO_COMMIT`). Our
+side is `h3wire-masque/examples/{ip-proxy,ip-client}.rs`, which read the same
+environment as connect-ip-go's programs, so each can take the place of one of them.
+
+`interop/connect-ip/run.sh` reuses connect-ip-go's own `integration/` harness: a
+`client`, a `proxy` and a `server` container on a client net and a server net, TUN
+devices in the client and the proxy, `ipv4.env` / `ipv6.env`. It clones connect-ip-go
+into `target/interop/connect-ip-go`, checks the commit, applies
+`connect-ip/connect-ip-go.patch`, builds the Go programs in `GO_IMAGE` and their images,
+and runs every cell with upstream's `docker-compose.yml` and our overrides (no upstream
+file is edited):
+
+- `common.yml` (every cell) passes `REQUEST_ADDRS` to the client and starts the client
+  only once the server listens: the server's `run.sh` first points its default route at
+  the proxy, and echoes answered before that leave through the Docker gateway and are
+  lost (our client is up within a few hundred milliseconds; upstream's is slower);
+- `h3wire-proxy.yml` runs `h3wire-ip-proxy` from our image as the proxy, through
+  `proxy-entry.sh`, which drops direct forwarding between the two Docker interfaces in
+  both families as upstream's `proxy/run.sh` does, so a pass proves the tunnel;
+- `h3wire-client.yml` runs `h3wire-ip-client` as the client, trusting the proxy
+  certificate.
+
+The proxy certificate is EC P-256 with `basicConstraints=critical,CA:FALSE` and
+`subjectAltName=DNS:proxy` (rustls refuses the Makefile's CN-only one); the server's is
+the Makefile's own. A cell passes when the client exits 0:
+
+- **ping:** 50 echo requests to the server at 50 ms intervals, all 50 answered
+  (connect-ip-go's `runPingTest` rule, which our client applies too);
+- **http:** `GET /hello` from the server on port 80 returns `Hello, World!\n`;
+- **ADDRESS_REQUEST:** with `REQUEST_ADDRS=<assigned address>,<another address>` the
+  client requests both after the tunnel is up and requires the answer to assign the
+  first (same request ID, same prefix) and reject the second, prints
+  `address-request: ok ids=<a>,<b>` (the cell also needs that line), then runs ping.
+
+`connect-ip/connect-ip-go.patch` changes the integration client and proxy only; the
+library is unchanged, and so is their protocol behaviour apart from address requests:
+
+- the client, with `REQUEST_ADDRS`, requests the prefixes (`RequestAddresses`) and
+  checks the next address assignment as above (the stock client never requests);
+- the proxy answers every address request (`ReceiveAddressRequest`, `Respond`) by the
+  rule `ip-proxy` uses: `ASSIGN_ADDR` if the request is its host prefix or the all-zero
+  address of its family, a rejection otherwise, with `ASSIGN_ADDR` added unsolicited
+  when no entry got it, so the list stays complete (the stock proxy leaves requests
+  unanswered, though RFC 9484 §4.7.2 says each SHALL get an Assigned Address).
+
+Run on 2026-11-18 with h3wire `e9f621d` plus this change: every mandatory cell
+passed, three runs in a row.
+
+| capability | peer | version | direction | result |
+|---|---|---|---|---|
+| CONNECT-IP ping, ipv4 | our proxy and client | - | h3wire → h3wire | pass |
+| CONNECT-IP ping, ipv4 / ipv6 | connect-ip-go proxy | connect-ip-go v0.7.0 | h3wire → peer | pass |
+| CONNECT-IP http, ipv4 / ipv6 | connect-ip-go proxy | connect-ip-go v0.7.0 | h3wire → peer | pass |
+| CONNECT-IP ping, ipv4 / ipv6 | connect-ip-go client | connect-ip-go v0.7.0 | peer → h3wire | pass |
+| CONNECT-IP http, ipv4 / ipv6 | connect-ip-go client | connect-ip-go v0.7.0 | peer → h3wire | pass |
+| CONNECT-IP ADDRESS_REQUEST, ipv4 / ipv6 | connect-ip-go proxy | connect-ip-go v0.7.0 | h3wire → peer | pass |
+| CONNECT-IP ADDRESS_REQUEST, ipv4 / ipv6 | connect-ip-go client | connect-ip-go v0.7.0 | peer → h3wire | pass |
+| CONNECT-IP (capsule) | connect-ip-go | connect-ip-go v0.7.0 | both | unsupported (5) |
+
+5. connect-ip-go needs HTTP Datagrams. Its client refuses a connection without them
+   (`Transport.Dial` in `transport.go`, the SETTINGS check in `client.go`), and its
+   `Conn` reads packets only from datagrams (`ReadPacket`) and discards DATAGRAM
+   capsules on the stream (`parseCapsule`). Neither side exercises the capsule carrier,
+   which `h3wire-masque`'s own tests cover.
+
+Observed: our client exits without closing its tunnel, so connect-ip-go's proxy logs
+`failed to read from connection: H3_REQUEST_CANCELLED` at the end of each h3wire → peer
+cell. The cells do not check the proxy's log.
 
 ## h3spec
 
