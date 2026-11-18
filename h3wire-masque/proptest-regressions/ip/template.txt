@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4c43a0fd2b7638189fa23c7a1ddd45f23d13bf3758d9b930fc947dc6d29fa491 # shrinks to s = Scope { target: Any, ipproto: None }

@@ -4,6 +4,7 @@
 
 mod capsule;
 mod prefix;
+mod template;
 
 pub use capsule::{
     ADDRESS_ASSIGN, ADDRESS_REQUEST, AssignedAddress, MAX_CONTROL_CAPSULE, ROUTE_ADVERTISEMENT,
@@ -11,3 +12,4 @@ pub use capsule::{
     encode_address_assign, encode_address_request, encode_routes,
 };
 pub use prefix::{IpPrefix, IpRange, PrefixError};
+pub use template::{IpTemplate, Scope, ScopeTarget};
