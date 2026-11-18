@@ -34,8 +34,8 @@ impl fmt::Display for ConnectError {
         match self {
             Self::Template(e) => e.fmt(f),
             Self::Http(e) => e.fmt(f),
-            Self::Rejected(r) => write!(f, "CONNECT-UDP rejected: {}", r.status()),
-            Self::Malformed => f.write_str("malformed CONNECT-UDP response"),
+            Self::Rejected(r) => write!(f, "tunnel request rejected: {}", r.status()),
+            Self::Malformed => f.write_str("malformed tunnel response"),
         }
     }
 }
@@ -114,6 +114,14 @@ mod tests {
 
     fn bad(status: u16, h: &HeaderMap) -> bool {
         malformed(StatusCode::from_u16(status).unwrap(), h)
+    }
+
+    #[test]
+    fn display_is_protocol_neutral() {
+        assert_eq!(
+            ConnectError::Malformed.to_string(),
+            "malformed tunnel response"
+        );
     }
 
     #[test]

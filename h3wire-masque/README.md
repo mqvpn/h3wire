@@ -62,7 +62,9 @@ has a client snippet and the details.
 - New `ip` module: CONNECT-IP (RFC 9484).
 - `TemplateError` gains `BadTarget` and `BadProto`, and `server::Reject` gains
   `NotConnectIp`; both enums are `#[non_exhaustive]`.
-- No behaviour change for CONNECT-UDP.
+- No behaviour change for CONNECT-UDP. The `Display` texts of `ConnectError`,
+  `TemplateError::Variables` and `CapsuleError::Malformed` changed to protocol-neutral
+  wording.
 
 See the [API documentation](https://docs.rs/h3wire-masque).
 

@@ -45,7 +45,9 @@ impl std::fmt::Display for TemplateError {
         f.write_str(match self {
             Self::Syntax => "invalid URI template",
             Self::NotHttps => "URI template scheme is not https",
-            Self::Variables => "URI template needs one target_host and one target_port",
+            Self::Variables => {
+                "URI template variables are missing, repeated, unknown or outside the path"
+            }
             Self::NotWholeSegment => "URI template variable is not a whole path segment",
             Self::BadHost => "invalid target host",
             Self::BadPort => "invalid target port",
@@ -392,6 +394,14 @@ mod tests {
 
     const DEFAULT: &str =
         "https://proxy.example/.well-known/masque/udp/{target_host}/{target_port}/";
+
+    #[test]
+    fn variables_display_is_protocol_neutral() {
+        assert_eq!(
+            TemplateError::Variables.to_string(),
+            "URI template variables are missing, repeated, unknown or outside the path"
+        );
+    }
 
     fn uri(s: &str) -> Uri {
         s.parse().unwrap()
