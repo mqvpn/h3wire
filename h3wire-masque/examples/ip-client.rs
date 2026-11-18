@@ -18,8 +18,11 @@
 //! With `REQUEST_ADDRS` (comma-separated prefixes, at least two) it then requests them
 //! and requires the answer to assign the first and reject the second, printing
 //! `address-request: ok ids=<a>,<b>`. Then it runs `TESTCASE`: `ping` (50 echo requests
-//! to `SERVER_ADDR`) or `http` (`GET /hello` from `SERVER_ADDR` port 80, which must
-//! return `Hello, World!\n`). The exit status is the test's.
+//! to `SERVER_ADDR`, passing only if all 50 were sent and answered, as connect-ip-go's
+//! client requires) or `http` (`GET /hello` from `SERVER_ADDR` port 80, which must
+//! return `Hello, World!\n`). The exit status is the test's. It refuses to run the test
+//! when no advertised route contains `SERVER_ADDR`, since the traffic would then bypass
+//! the tunnel.
 //!
 //! Needs `CAP_NET_ADMIN`, `ip` from iproute2 and `ping`. Linux only: elsewhere it exits
 //! with an error.
@@ -203,6 +206,25 @@ mod linux {
         Ok(())
     }
 
+    /// Whether one of `routes` contains `server`, so its traffic goes through the tunnel.
+    fn routes_to(routes: &[IpRange], server: IpAddr) -> bool {
+        routes.iter().any(|r| r.contains(server))
+    }
+
+    /// The transmitted and received counts of ping's summary line
+    /// (`50 packets transmitted, 49 received, ...`).
+    fn ping_counts(out: &str) -> Option<(u32, u32)> {
+        let line = out.lines().find(|l| l.contains(" packets transmitted, "))?;
+        let mut f = line.split(", ");
+        let sent = f
+            .next()?
+            .strip_suffix(" packets transmitted")?
+            .parse()
+            .ok()?;
+        let got = f.next()?.strip_suffix(" received")?.parse().ok()?;
+        Some((sent, got))
+    }
+
     /// The non-rejection prefixes of an `ADDRESS_ASSIGN` list.
     fn assigned(list: &[AssignedAddress]) -> Vec<IpPrefix> {
         list.iter()
@@ -277,6 +299,18 @@ mod linux {
         let (addrs, routes) = timeout(WAIT, configure(&mut tunnel))
             .await
             .map_err(|_| "no address assignment and routes within 10 s")??;
+        if !routes_to(&routes, cfg.server) {
+            let list: Vec<_> = routes
+                .iter()
+                .map(|r| format!("{}-{}", r.start(), r.end()))
+                .collect();
+            return Err(format!(
+                "SERVER_ADDR {} is in none of the advertised routes [{}]",
+                cfg.server,
+                list.join(", ")
+            )
+            .into());
+        }
         let mut cidrs = Vec::new();
         for r in &routes {
             let c = range_to_cidr(r)
@@ -423,11 +457,27 @@ mod linux {
     async fn testcase(t: TestCase, server: IpAddr) -> Result<bool, BoxError> {
         match t {
             TestCase::Ping => {
-                let st = tokio::process::Command::new("ping")
+                let out = tokio::process::Command::new("ping")
                     .args(["-c", "50", "-i", "0.05", &server.to_string()])
-                    .status()
+                    .output()
                     .await?;
-                Ok(st.success())
+                let text = String::from_utf8_lossy(&out.stdout);
+                eprint!("{text}{}", String::from_utf8_lossy(&out.stderr));
+                // As connect-ip-go's client: all 50 sent, every one answered.
+                match ping_counts(&text) {
+                    Some((50, 50)) => {
+                        println!("ping: ok 50/50");
+                        Ok(true)
+                    }
+                    Some((sent, got)) => {
+                        eprintln!("ping: {sent} transmitted, {got} received; want 50 and 50");
+                        Ok(false)
+                    }
+                    None => {
+                        eprintln!("ping: no summary line ({})", out.status);
+                        Ok(false)
+                    }
+                }
             }
             TestCase::Http => {
                 let to = SocketAddr::new(server, 80);
@@ -644,6 +694,42 @@ mod linux {
                     v(&["route", "add", "2001:db8:3::/48", "dev", "tun1"]),
                 ]
             );
+        }
+
+        #[test]
+        fn ping_summary() {
+            let line = |s: &str| format!("--- 194.166.100.3 ping statistics ---\n{s}\nrtt ...\n");
+            let f = |s: &str| ping_counts(&line(s));
+            assert_eq!(
+                f("50 packets transmitted, 50 received, 0% packet loss, time 2456ms"),
+                Some((50, 50))
+            );
+            assert_eq!(
+                f("50 packets transmitted, 49 received, 2% packet loss, time 2456ms"),
+                Some((50, 49))
+            );
+            assert_eq!(
+                f("50 packets transmitted, 0 received, 100% packet loss, time 2456ms"),
+                Some((50, 0))
+            );
+            assert_eq!(
+                f("50 packets transmitted, 48 received, +2 errors, 4% packet loss, time 2456ms"),
+                Some((50, 48))
+            );
+            assert_eq!(ping_counts("ping: connect: Network is unreachable\n"), None);
+            assert_eq!(ping_counts(""), None);
+        }
+
+        #[test]
+        fn server_route_check() {
+            let routes = [range("194.166.100.0", "194.166.100.255")];
+            assert!(routes_to(&routes, "194.166.100.3".parse().unwrap()));
+            assert!(!routes_to(&routes, "194.166.101.3".parse().unwrap()));
+            let v6 = [range("2001:db8:2::", "2001:db8:2::ffff:ffff:ffff:ffff")];
+            assert!(!routes_to(&v6, "194.166.100.3".parse().unwrap()));
+            assert!(routes_to(&v6, "2001:db8:2::3".parse().unwrap()));
+            assert!(!routes_to(&routes, "::ffff:194.166.100.3".parse().unwrap()));
+            assert!(!routes_to(&[], "194.166.100.3".parse().unwrap()));
         }
 
         #[test]
