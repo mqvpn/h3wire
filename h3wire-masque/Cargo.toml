@@ -23,7 +23,7 @@ proptest = "1"
 h3wire-quinn = { path = "../h3wire-quinn", version = "0.2.0" }
 h3wire-async = { path = "../h3wire-async", version = "0.2.0", features = ["tokio", "__testing"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 sha2 = "0.10"
 futures = "0.3"
@@ -32,6 +32,7 @@ tower-service = "0.3"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 rustix = { version = "1", features = ["net"] }
+tokio-tun = "1"
 
 [[example]]
 name = "proxy"
@@ -41,3 +42,11 @@ test = true
 [[example]]
 name = "masque-client"
 path = "examples/client.rs"
+
+[[example]]
+name = "ip-proxy"
+test = true
+
+[[example]]
+name = "ip-client"
+test = true
