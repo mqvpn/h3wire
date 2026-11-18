@@ -28,6 +28,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 /// The largest IP packet a tunnel carries: a 40-byte IPv6 header and 65,535 bytes.
 pub const MAX_IP_PACKET: usize = 65_575;
 
+/// The IPv6 minimum link MTU (RFC 8200 section 5).
+const IPV6_MIN_MTU: usize = 1280;
+
 /// How many of the peer's address requests may await an answer.
 const MAX_PENDING: usize = 1024;
 
@@ -293,7 +296,9 @@ impl IpSender {
     /// address policy applies ([`check_outgoing`](Self::check_outgoing) is the
     /// application's to call). After [`finish`](Self::finish), `Closed`. The datagram
     /// carrier never falls back to a capsule; the capsule carrier waits for stream credit.
-    /// Cancel-safe: a dropped pending send wrote nothing.
+    /// An IPv6 packet the datagram carrier refuses while [`max_payload`](Self::max_payload)
+    /// is below 1280 aborts the stream with `H3_DATAGRAM_ERROR` and returns `MtuTooSmall`
+    /// (RFC 9484 section 7.2). Cancel-safe: a dropped pending send wrote nothing.
     pub async fn send(&mut self, packet: Bytes) -> Result<(), IpError> {
         if !matches!(packet.first().map(|b| b >> 4), Some(4 | 6)) {
             return Err(IpError::Malformed);
@@ -301,7 +306,17 @@ impl IpSender {
         if packet.len() > MAX_IP_PACKET {
             return Err(IpError::TooLarge);
         }
-        Ok(self.tx.send_payload(packet).await?)
+        let v6 = packet[0] >> 4 == 6;
+        match self.tx.send_payload(packet).await {
+            // RFC 9484 section 7.2: an IPv6 packet refused while 1280 cannot fit.
+            Err(TxError::Datagram(DatagramError::TooLarge))
+                if v6 && self.max_payload().is_some_and(|m| m < IPV6_MIN_MTU) =>
+            {
+                self.abort(H3Code::DATAGRAM_ERROR);
+                Err(IpError::MtuTooSmall)
+            }
+            r => Ok(r?),
+        }
     }
 
     /// Send `ADDRESS_ASSIGN` with the full list of addresses assigned to the peer (*A*);
