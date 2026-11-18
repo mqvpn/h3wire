@@ -13,7 +13,9 @@ public API.
 The `ip` module tunnels IP packets (RFC 9484): `ip::client::connect` and
 `ip::server::accept` run the handshake, and an `IpTunnel` carries packets and the
 `ADDRESS_ASSIGN`, `ADDRESS_REQUEST` and `ROUTE_ADVERTISEMENT` capsules. Spawn
-`IpPending::tunnel()` after returning the response. Its examples `ip-proxy` and `ip-client`
+`IpPending::tunnel()` after returning the response. A non-2xx response is
+`ConnectError::Failed` with the status and headers (`Proxy-Status` included); the library
+aborts the request, as RFC 9484 sections 4.1 and 4.5 require. Its examples `ip-proxy` and `ip-client`
 (Linux, TUN device) are checked against connect-ip-go; the matrix is in
 [docs/interop.md](https://github.com/mqvpn/h3wire/blob/main/docs/interop.md).
 
@@ -49,10 +51,6 @@ The `ip` module tunnels IP packets (RFC 9484): `ip::client::connect` and
 - Hop-limit decrement on encapsulation, and ICMP error generation (Packet Too Big
   included), belong to the IP stack behind the tunnel (sections 7.2, 7.2.1, 10.1).
 - Under `Policy::Unchecked`, source address validation is the application's (section 11).
-- A rejected request (`ConnectError::Rejected`) is over and never a tunnel. The error
-  carries the response; the request side is already finished, and dropping the response
-  before the end of its body cancels the stream with `H3_REQUEST_CANCELLED` (sections 4.1,
-  4.5).
 
 The [`ip` module documentation](https://docs.rs/h3wire-masque/latest/h3wire_masque/ip/)
 has a client snippet and the details.
@@ -62,6 +60,7 @@ has a client snippet and the details.
 - New `ip` module: CONNECT-IP (RFC 9484).
 - `TemplateError` gains `BadTarget` and `BadProto`, and `server::Reject` gains
   `NotConnectIp`; both enums are `#[non_exhaustive]`.
+- `ConnectError` gains `Failed`, the status and headers of a non-2xx CONNECT-IP response.
 - No behaviour change for CONNECT-UDP. The `Display` texts of `ConnectError`,
   `TemplateError::Variables` and `CapsuleError::Malformed` changed to protocol-neutral
   wording.

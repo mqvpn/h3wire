@@ -8,6 +8,10 @@
 //! exists only once the response has been sent, so awaiting it inside the service
 //! deadlocks.
 //!
+//! A non-2xx response is [`ConnectError::Failed`](crate::client::ConnectError::Failed),
+//! never a tunnel: the error carries the status and headers (`Proxy-Status` included), and
+//! the library aborts the request, as RFC 9484 sections 4.1 and 4.5 require.
+//!
 //! # What the library checks
 //!
 //! Every received packet is judged by a [`Policy`]. With the default,
@@ -82,11 +86,6 @@
 //! - Under [`Policy::Unchecked`], source address validation is the application's
 //!   (section 11 requires following BCP 38 wherever an endpoint knows the prefixes its
 //!   peer may send from).
-//! - A rejected request ([`ConnectError::Rejected`](crate::client::ConnectError::Rejected))
-//!   is over and never a tunnel: the client treats it as failed (sections 4.1 and 4.5).
-//!   The error carries the response, whose body can be read; the request side is already
-//!   finished, and dropping the response before the end of its body cancels the stream
-//!   with `H3_REQUEST_CANCELLED`.
 //!
 //! A client opens a tunnel, asks for an address and accepts what the proxy offers:
 //!

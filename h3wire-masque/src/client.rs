@@ -22,8 +22,13 @@ pub enum ConnectError {
     Template(TemplateError),
     /// The request or the connection failed.
     Http(Error),
-    /// A non-2xx response, to read.
+    /// A non-2xx response to a CONNECT-UDP request, to read. Read it to the end or drop it
+    /// promptly: holding it unread keeps the request open, and the client must abort a
+    /// failed request (RFC 9298 section 3.1).
     Rejected(Response<RecvBody>),
+    /// A non-2xx response to a CONNECT-IP request: its status and headers. The request
+    /// was aborted (RFC 9484 sections 4.1 and 4.5), so there is no body to read.
+    Failed(Response<()>),
     /// A 204/205/206, or a 2xx with `Content-Length`, `Content-Type` or
     /// `Transfer-Encoding`; the request was aborted with `H3_MESSAGE_ERROR`.
     Malformed,
@@ -35,6 +40,7 @@ impl fmt::Display for ConnectError {
             Self::Template(e) => e.fmt(f),
             Self::Http(e) => e.fmt(f),
             Self::Rejected(r) => write!(f, "tunnel request rejected: {}", r.status()),
+            Self::Failed(r) => write!(f, "tunnel request failed: {}", r.status()),
             Self::Malformed => f.write_str("malformed tunnel response"),
         }
     }

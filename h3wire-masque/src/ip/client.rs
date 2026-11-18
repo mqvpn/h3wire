@@ -33,10 +33,10 @@ pub fn request<B: Default>(
 
 /// Open a CONNECT-IP tunnel for `scope`: request, response, validation, upgrade, then the
 /// peer's SETTINGS (to choose the carrier). A non-2xx response is
-/// [`ConnectError::Rejected`] and no tunnel exists: the error carries the response, whose
-/// body can be read, and the request side is already finished. Dropping the response
-/// before the end of its body cancels the stream with `H3_REQUEST_CANCELLED`.
-#[allow(clippy::result_large_err)] // `Rejected` hands the response back unboxed
+/// [`ConnectError::Failed`] and no tunnel exists: the error carries the status and headers
+/// (`Proxy-Status` included). The request is aborted: the body is dropped, which cancels
+/// the stream with `H3_REQUEST_CANCELLED` unless the body had already ended.
+#[allow(clippy::result_large_err)] // `Failed` hands the response head back unboxed
 pub async fn connect<B>(
     send: &mut SendRequest<B>,
     template: &IpTemplate,
@@ -50,7 +50,8 @@ where
     let req = request(template, scope).map_err(ConnectError::Template)?;
     let mut resp = send.send_request(req).await.map_err(ConnectError::Http)?;
     if !resp.status().is_success() {
-        return Err(ConnectError::Rejected(resp));
+        // RFC 9484 sections 4.1 and 4.5: the client MUST abort a failed request.
+        return Err(ConnectError::Failed(resp.map(|_| ())));
     }
     let on = upgrade::on(&mut resp);
     if malformed(resp.status(), resp.headers()) {

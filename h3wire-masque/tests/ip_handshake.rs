@@ -162,26 +162,24 @@ async fn ip_client_204_205_206_malformed() {
     .await
 }
 
-/// A non-2xx is `Rejected` with a readable body and no tunnel. Dropping it before the end
-/// of its body cancels the request (RFC 9484 section 4.1: "the client MUST abort the
-/// request").
+/// A non-2xx is `Failed` with the status and headers and no tunnel, and the library aborts
+/// the request itself (RFC 9484 sections 4.1 and 4.5: "the client MUST abort the request").
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ip_client_non2xx_rejected_with_body() {
+async fn ip_client_non2xx_fails_and_aborts() {
     with_timeout(async {
         let (mut p, mut reqs) = masque().await;
         let mut resp = reply(403, full("denied"));
         resp.headers_mut()
             .insert("content-type", HeaderValue::from_static("text/plain"));
         let r = raw_ip_server_with(&mut p, &mut reqs, resp).await;
-        let Err(ConnectError::Rejected(resp)) = r.c else {
+        let Err(ConnectError::Failed(resp)) = r.c else {
             panic!("{:?}", r.c)
         };
         assert_eq!(resp.status(), 403);
         assert_eq!(resp.headers()["content-type"], "text/plain");
-        assert_eq!(collect(resp.into_body()).await.unwrap().0, "denied");
         assert!(matches!(r.st.unwrap_err().kind(), ErrorKind::NotUpgraded));
 
-        // The server keeps the body open; the client drops the response unread.
+        // The server keeps the body open; the library, not the test, cancels the stream.
         let conns = conns().await;
         let mut cfg = Config::default();
         cfg.enable_connect_protocol = true;
@@ -208,11 +206,10 @@ async fn ip_client_non2xx_rejected_with_body() {
         peer.send_headers(S0, &[(":status", "403")], false).unwrap();
         peer.send_body(S0, b"more to come", false);
         let (r, _send) = drive(&mut peer, c).await.unwrap();
-        let Err(ConnectError::Rejected(resp)) = r else {
+        let Err(ConnectError::Failed(resp)) = r else {
             panic!("{r:?}")
         };
         assert_eq!(resp.status(), 403);
-        drop(resp);
         let cancelled = |p: &Peer| {
             p.trace().iter().any(|o| match o {
                 PeerObs::Reset { stream, code } => *stream == S0 && *code == RC.0,
@@ -239,8 +236,8 @@ async fn ip_path_mismatch_404() {
         let r = ip::server::accept(&mut req, &other).unwrap_err();
         assert_eq!(r, Reject::Status(StatusCode::NOT_FOUND));
         tx.send(reply(404, empty())).unwrap();
-        let Err(ConnectError::Rejected(resp)) = c.await.unwrap() else {
-            panic!("not rejected")
+        let Err(ConnectError::Failed(resp)) = c.await.unwrap() else {
+            panic!("not failed")
         };
         assert_eq!(resp.status(), 404);
         // The connection still serves tunnels.
@@ -403,10 +400,10 @@ async fn ip_pending_dropped_releases_claim() {
         let (mut req, tx) = reqs.recv().await.unwrap();
         drop(accept(&mut req).unwrap());
         tx.send(reply(403, full("no"))).unwrap();
-        let Err(ConnectError::Rejected(resp)) = c.await.unwrap() else {
-            panic!("not rejected")
+        let Err(ConnectError::Failed(resp)) = c.await.unwrap() else {
+            panic!("not failed")
         };
-        assert_eq!(collect(resp.into_body()).await.unwrap().0, "no");
+        assert_eq!(resp.status(), 403);
         // Released: a 200 nobody claimed is aborted with H3_REQUEST_CANCELLED.
         let c = spawn_ip_connect(&p);
         let (mut req, tx) = reqs.recv().await.unwrap();
