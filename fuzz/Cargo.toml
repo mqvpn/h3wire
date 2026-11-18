@@ -61,3 +61,24 @@ path = "fuzz_targets/template_match.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ip_capsule"
+path = "fuzz_targets/ip_capsule.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ip_template"
+path = "fuzz_targets/ip_template.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ip_policy"
+path = "fuzz_targets/ip_policy.rs"
+test = false
+doc = false
+bench = false

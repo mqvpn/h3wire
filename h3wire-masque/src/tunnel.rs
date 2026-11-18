@@ -15,28 +15,19 @@
 //!   ended aborts with `H3_REQUEST_CANCELLED`.
 //! - **Threads.** [`UdpTunnel`], [`UdpSender`] and [`UdpReceiver`] are `Send` and `Sync`.
 
-use crate::capsule::{self, CapsuleError, DATAGRAM, Decoder};
-use bytes::{Bytes, BytesMut};
-use h3wire_async::core::{AbortSource, H3Code, varint};
-use h3wire_async::datagram::{DatagramReceiver, DatagramSender, Datagrams};
-use h3wire_async::upgrade::{Tunnel, TunnelRecv, TunnelSend};
-use h3wire_async::{DatagramError, Error, ErrorKind};
+use crate::carrier::{self, Limits, Raw, Rx, Step, Tx, TxError};
+use bytes::Bytes;
+use h3wire_async::core::H3Code;
+use h3wire_async::datagram::Datagrams;
+use h3wire_async::upgrade::Tunnel;
+use h3wire_async::{DatagramError, Error};
 use std::fmt;
 use std::future::{Future, poll_fn};
-use std::pin::pin;
-use std::task::{Context, Poll};
-
-/// Progress steps per carrier in one `recv` poll before yielding.
-const MAX_STEPS: usize = 32;
-
-/// Stream bytes a tunnel buffers while it waits for the peer's SETTINGS; past this it
-/// stops waiting and carries capsules.
-const SETTINGS_WAIT_BYTES: usize = 64 * 1024;
 
 /// The largest UDP payload a context-ID-0 tunnel carries (RFC 9298 section 5).
 pub const MAX_UDP_PAYLOAD: usize = 65_527;
 
-/// How a tunnel sends UDP payloads.
+/// How a tunnel sends its payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Carrier {
     /// HTTP Datagrams (RFC 9297 section 2).
@@ -86,6 +77,16 @@ impl From<Error> for UdpError {
     }
 }
 
+impl From<TxError> for UdpError {
+    fn from(e: TxError) -> Self {
+        match e {
+            TxError::Closed => Self::Closed,
+            TxError::Datagram(e) => Self::Datagram(e),
+            TxError::Http(e) => Self::Http(e),
+        }
+    }
+}
+
 /// A CONNECT-UDP tunnel; [`split`](Self::split) gives independent halves.
 #[derive(Debug)]
 pub struct UdpTunnel {
@@ -94,53 +95,22 @@ pub struct UdpTunnel {
 }
 
 impl UdpTunnel {
-    /// Wait for `settings` (`true`: the peer's SETTINGS arrived) to choose the carrier.
-    /// The stream is read meanwhile, so the wait cannot outlive the request: its bytes go
-    /// to the capsule decoder, a reset or error is returned, and a FIN or more than
-    /// [`SETTINGS_WAIT_BYTES`] received settles without SETTINGS (capsule carrier).
+    /// Wait for `settings` (`true`: the peer's SETTINGS arrived) to choose the carrier;
+    /// see [`carrier::open`].
     pub(crate) async fn open(
         tunnel: Tunnel,
         dgrams: Option<Datagrams>,
         settings: impl Future<Output = bool>,
     ) -> Result<Self, Error> {
-        let (tx, mut rx) = tunnel.split();
-        let mut capsules = Capsules::default();
-        let mut eof = false;
-        let mut settings = pin!(settings);
-        let settings_ok = poll_fn(|cx| {
-            if let Poll::Ready(ok) = settings.as_mut().poll(cx) {
-                return Poll::Ready(Ok(ok));
-            }
-            while !eof && capsules.dec.buffered() <= SETTINGS_WAIT_BYTES {
-                match pin!(rx.recv()).poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Ready(Ok(Some(b))) => capsules.dec.push(b),
-                    Poll::Ready(Ok(None)) => eof = true,
-                }
-            }
-            Poll::Ready(Ok(false))
-        })
-        .await?;
-        let (dtx, drx) = match dgrams.map(Datagrams::split) {
-            Some((s, r)) => (Some(s), Some(r)),
-            None => (None, None),
+        let limits = Limits {
+            max_payload: MAX_UDP_PAYLOAD,
+            control: |_| false,
+            max_control: 0,
         };
-        let dtx = dtx.filter(|d| settings_ok && d.max_payload().is_some());
+        let (tx, rx) = carrier::open(tunnel, dgrams, settings, limits).await?;
         Ok(UdpTunnel {
-            send: UdpSender {
-                tunnel: tx,
-                dgrams: dtx,
-                finished: false,
-            },
-            recv: UdpReceiver {
-                tunnel: rx,
-                dgrams: drx,
-                capsules,
-                dgram_first: false,
-                eof,
-                end: None,
-            },
+            send: UdpSender { tx },
+            recv: UdpReceiver { rx },
         })
     }
 
@@ -183,10 +153,7 @@ impl UdpTunnel {
 /// The sending half of a [`UdpTunnel`].
 #[derive(Debug)]
 pub struct UdpSender {
-    tunnel: TunnelSend,
-    /// `Some` iff the carrier is datagrams.
-    dgrams: Option<DatagramSender>,
-    finished: bool,
+    tx: Tx,
 }
 
 impl UdpSender {
@@ -199,34 +166,17 @@ impl UdpSender {
         if payload.len() > MAX_UDP_PAYLOAD {
             return Err(UdpError::TooLarge);
         }
-        if self.finished {
-            return Err(UdpError::Closed);
-        }
-        // Context ID 0, one byte.
-        let value = Bytes::from([&[0][..], &payload].concat());
-        if let Some(d) = &self.dgrams {
-            return d.send(value).map_err(|e| match e {
-                DatagramError::Closed => UdpError::Closed,
-                e => UdpError::Datagram(e),
-            });
-        }
-        // One `TunnelSend::send` call per capsule: it takes the `Bytes` whole or not at
-        // all, so a cancelled send never leaves half a capsule on the stream.
-        let mut b = BytesMut::new();
-        capsule::encode(DATAGRAM, &value, &mut b).expect("within varint range");
-        Ok(self.tunnel.send(b.freeze()).await?)
+        Ok(self.tx.send_payload(payload).await?)
     }
 
     /// Finish the stream after every payload accepted so far.
     pub fn finish(&mut self) -> Result<(), UdpError> {
-        self.tunnel.finish()?;
-        self.finished = true;
-        Ok(())
+        Ok(self.tx.finish()?)
     }
 
     /// Abort the whole request (both directions) with `code`; idempotent.
     pub fn abort(&self, code: H3Code) {
-        self.tunnel.abort(code)
+        self.tx.abort(code)
     }
 
     /// The largest payload [`send`](Self::send) accepts now: the datagram limit minus the
@@ -234,158 +184,41 @@ impl UdpSender {
     /// `Some(MAX_UDP_PAYLOAD)` for the capsule carrier. `None` with [`Carrier::Datagram`]
     /// when the datagram limit is unknown now or leaves no room for a payload.
     pub fn max_payload(&self) -> Option<usize> {
-        match &self.dgrams {
-            Some(d) => d
-                .max_payload()?
-                .checked_sub(1)
-                .map(|n| n.min(MAX_UDP_PAYLOAD)),
-            None => Some(MAX_UDP_PAYLOAD),
-        }
+        self.tx.max_payload(MAX_UDP_PAYLOAD)
     }
 
     /// The carrier chosen when the tunnel was built.
     pub fn carrier(&self) -> Carrier {
-        match self.dgrams {
-            Some(_) => Carrier::Datagram,
-            None => Carrier::Capsule,
-        }
+        self.tx.carrier()
     }
 }
 
 /// The receiving half of a [`UdpTunnel`].
 #[derive(Debug)]
 pub struct UdpReceiver {
-    tunnel: TunnelRecv,
-    /// `None` without datagrams or once the handle ended.
-    dgrams: Option<DatagramReceiver>,
-    capsules: Capsules,
-    /// Which carrier the next `recv` polls first; flips every call.
-    dgram_first: bool,
-    /// The tunnel's FIN arrived.
-    eof: bool,
-    /// The terminal result `recv` returned (`Ok(None)` or an error), repeated after.
-    end: Option<Result<Option<Bytes>, UdpError>>,
+    rx: Rx,
 }
 
 impl UdpReceiver {
     /// The next UDP payload from either carrier; `Ok(None)` once the peer finished the
     /// stream on a capsule boundary. Cancel-safe: the decoder state lives here.
     pub async fn recv(&mut self) -> Result<Option<Bytes>, UdpError> {
-        self.dgram_first = !self.dgram_first;
-        poll_fn(|cx| self.poll_recv(cx)).await
+        self.rx.start();
+        poll_fn(|cx| {
+            self.rx.poll_recv(cx, |raw| match raw {
+                Raw::Payload(b) => Step::Yield(b),
+                // RFC 9298 section 5, RFC 9297 section 3.3.
+                Raw::Oversized => Step::Fail(H3Code::MESSAGE_ERROR),
+                _ => Step::Drop,
+            })
+        })
+        .await
+        .map_err(UdpError::from)
     }
 
     /// Abort the whole request (both directions) with `code`; idempotent.
     pub fn abort(&self, code: H3Code) {
-        self.tunnel.abort(code)
-    }
-
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>, UdpError>> {
-        if let Some(r) = &self.end {
-            return Poll::Ready(r.clone());
-        }
-        let mut busy = false;
-        for dgram in [self.dgram_first, !self.dgram_first] {
-            // Retry a carrier that made progress (a pushed chunk may complete a capsule),
-            // a bounded number of times so a flood of dropped input cannot hog the poll.
-            let mut steps = 0;
-            loop {
-                let r = if dgram {
-                    self.poll_dgram(cx)
-                } else {
-                    self.poll_capsule(cx)
-                };
-                match r {
-                    Poll::Ready(Some(r)) => {
-                        // Errors are terminal too: the async layer reports an abort once.
-                        if !matches!(r, Ok(Some(_))) {
-                            self.end = Some(r.clone());
-                        }
-                        return Poll::Ready(r);
-                    }
-                    Poll::Ready(None) if steps < MAX_STEPS => steps += 1,
-                    Poll::Ready(None) => {
-                        busy = true;
-                        break;
-                    }
-                    Poll::Pending => break,
-                }
-            }
-        }
-        if busy {
-            cx.waker().wake_by_ref();
-        }
-        Poll::Pending
-    }
-
-    /// `Ready(None)`: something was consumed but there is nothing to return yet.
-    fn poll_dgram(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Option<Bytes>, UdpError>>> {
-        let Some(d) = &mut self.dgrams else {
-            return Poll::Pending;
-        };
-        let r = pin!(d.recv()).poll(cx);
-        match r {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e.into()))),
-            Poll::Ready(Ok(None)) => {
-                self.dgrams = None;
-                Poll::Ready(None)
-            }
-            Poll::Ready(Ok(Some(b))) => match varint::decode(&b) {
-                Some((0, n)) if b.len() - n > MAX_UDP_PAYLOAD => {
-                    Poll::Ready(Some(Err(self.fail())))
-                }
-                Some((0, n)) => Poll::Ready(Some(Ok(Some(b.slice(n..))))),
-                // Another context, or no context ID at all: dropped.
-                _ => Poll::Ready(None),
-            },
-        }
-    }
-
-    fn poll_capsule(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Option<Bytes>, UdpError>>> {
-        match self.capsules.next() {
-            Err(_) => return Poll::Ready(Some(Err(self.fail()))),
-            Ok(Some(p)) => return Poll::Ready(Some(Ok(Some(p)))),
-            Ok(None) => {}
-        }
-        if self.eof {
-            return Poll::Ready(Some(match self.capsules.dec.finish() {
-                Ok(()) => Ok(None),
-                Err(_) => Err(self.fail()),
-            }));
-        }
-        match pin!(self.tunnel.recv()).poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e.into()))),
-            Poll::Ready(Ok(Some(b))) => {
-                self.capsules.dec.push(b);
-                Poll::Ready(None)
-            }
-            Poll::Ready(Ok(None)) => {
-                self.eof = true;
-                Poll::Ready(None)
-            }
-        }
-    }
-
-    /// Abort with `H3_MESSAGE_ERROR` (RFC 9298 section 5, RFC 9297 section 3.3); the
-    /// error the caller sees.
-    fn fail(&self) -> UdpError {
-        self.tunnel.abort(H3Code::MESSAGE_ERROR);
-        UdpError::Http(
-            ErrorKind::StreamAborted {
-                code: H3Code::MESSAGE_ERROR,
-                source: AbortSource::Local,
-                retryable: false,
-            }
-            .into(),
-        )
+        self.rx.abort(code)
     }
 }
 
@@ -395,88 +228,3 @@ const _: () = {
     send_sync::<UdpSender>();
     send_sync::<UdpReceiver>();
 };
-
-/// Where the capsule decoder stands in the current capsule.
-#[derive(Clone, Copy, Debug, Default)]
-enum At {
-    #[default]
-    Head,
-    /// A DATAGRAM capsule: its context ID is next.
-    Context,
-    /// Context ID 0 was consumed: the payload is next.
-    Payload,
-    /// Another capsule type or context: drop the rest.
-    Skip,
-}
-
-/// The capsule carrier's receive state: plain data, so a cancelled `recv` loses nothing.
-#[derive(Debug, Default)]
-struct Capsules {
-    dec: Decoder,
-    at: At,
-}
-
-impl Capsules {
-    /// The next context-0 payload the pushed bytes complete.
-    fn next(&mut self) -> Result<Option<Bytes>, CapsuleError> {
-        loop {
-            match self.at {
-                At::Head => match self.dec.next()? {
-                    None => return Ok(None),
-                    Some(h) if h.ty == DATAGRAM => self.at = At::Context,
-                    Some(_) => self.at = At::Skip,
-                },
-                At::Context => match self.dec.peek_varint()? {
-                    None => return Ok(None),
-                    Some(0) => self.at = At::Payload,
-                    Some(_) => self.at = At::Skip,
-                },
-                At::Payload => match self.dec.take(MAX_UDP_PAYLOAD)? {
-                    None => return Ok(None),
-                    Some(p) => {
-                        self.at = At::Head;
-                        return Ok(Some(p));
-                    }
-                },
-                At::Skip => {
-                    if !self.dec.skip()? {
-                        return Ok(None);
-                    }
-                    self.at = At::Head;
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cap(value: &[u8]) -> Bytes {
-        let mut b = BytesMut::new();
-        capsule::encode(DATAGRAM, value, &mut b).unwrap();
-        b.freeze()
-    }
-
-    #[test]
-    fn nonzero_context_capsule_never_buffered() {
-        let mut c = Capsules::default();
-        let big = cap(&[&[0x40, 0x64][..], &vec![9; 1 << 20]].concat());
-        for part in big.chunks(4096) {
-            c.dec.push(Bytes::copy_from_slice(part));
-            assert_eq!(c.next(), Ok(None));
-            assert_eq!(c.dec.buffered(), 0);
-        }
-        c.dec.push(cap(b"\x00ok"));
-        assert_eq!(c.next(), Ok(Some(Bytes::from_static(b"ok"))));
-        assert_eq!(c.dec.finish(), Ok(()));
-    }
-
-    #[test]
-    fn oversized_context_zero_capsule_too_large() {
-        let mut c = Capsules::default();
-        c.dec.push(cap(&vec![0; MAX_UDP_PAYLOAD + 2]));
-        assert_eq!(c.next(), Err(CapsuleError::TooLarge));
-    }
-}

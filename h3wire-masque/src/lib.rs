@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 mp0rta
-//! MASQUE CONNECT-UDP (RFC 9298) over [`h3wire_async`].
+//! MASQUE CONNECT-UDP (RFC 9298) and CONNECT-IP (RFC 9484) over [`h3wire_async`].
+//!
+//! CONNECT-IP lives in the [`ip`] module; its documentation covers the packet policy
+//! and the RFC 9484 duties the application keeps. The rest of this page is about
+//! CONNECT-UDP.
 //!
 //! The client opens a tunnel with [`client::connect`]. A server's service calls
 //! [`server::accept`], returns [`Pending::response`](server::Pending::response), and
@@ -69,7 +73,9 @@
 #![warn(missing_docs)]
 
 pub mod capsule;
+mod carrier;
 pub mod client;
+pub mod ip;
 pub mod server;
 pub mod template;
 pub mod tunnel;

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 mp0rta
-//! The RFC 9298 §2 URI template subset (design spec §2.2).
+//! The RFC 9298 §2 URI template subset (design spec §2.2), shared with CONNECT-IP.
 //!
-//! Absolute `https` templates; RFC 6570 Level 1 `{target_host}` and `{target_port}`, each
-//! exactly once, each a whole path segment. A literal query is allowed and must match
+//! Absolute `https` templates; RFC 6570 Level 1 variables (`{target_host}` and `{target_port}`
+//! for CONNECT-UDP, `{target}` and `{ipproto}` for CONNECT-IP), each at most once, each a whole
+//! path segment. A literal query is allowed and must match
 //! exactly; variables are not allowed there or in the authority.
 
 use http::Uri;
@@ -21,7 +22,9 @@ pub enum TemplateError {
     Syntax,
     /// The scheme is not `https`.
     NotHttps,
-    /// Not exactly one `target_host` and one `target_port` in the path.
+    /// A variable is missing, repeated, unknown, or outside the path: CONNECT-UDP needs exactly one
+    /// `target_host` and one `target_port`; CONNECT-IP allows `target` and `ipproto` at most once,
+    /// and a scope that needs an absent variable cannot be expanded.
     Variables,
     /// A variable shares its path segment with other text.
     NotWholeSegment,
@@ -31,6 +34,10 @@ pub enum TemplateError {
     BadPort,
     /// The URI's path or query does not fit the template.
     NoMatch,
+    /// A CONNECT-IP `target` is empty, malformed or has a bad percent escape.
+    BadTarget,
+    /// A CONNECT-IP `ipproto` is not `*` or a number up to 255, or has a bad percent escape.
+    BadProto,
 }
 
 impl std::fmt::Display for TemplateError {
@@ -38,11 +45,15 @@ impl std::fmt::Display for TemplateError {
         f.write_str(match self {
             Self::Syntax => "invalid URI template",
             Self::NotHttps => "URI template scheme is not https",
-            Self::Variables => "URI template needs one target_host and one target_port",
+            Self::Variables => {
+                "URI template variables are missing, repeated, unknown or outside the path"
+            }
             Self::NotWholeSegment => "URI template variable is not a whole path segment",
             Self::BadHost => "invalid target host",
             Self::BadPort => "invalid target port",
             Self::NoMatch => "URI does not match the template",
+            Self::BadTarget => "invalid CONNECT-IP target",
+            Self::BadProto => "invalid CONNECT-IP ipproto",
         })
     }
 }
@@ -78,23 +89,24 @@ pub enum TargetHost {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Seg {
+pub(crate) enum Seg {
     Lit(String),
-    Host,
-    Port,
+    Var(&'static str),
 }
 
-/// A parsed template.
+/// The shared template machinery: an `https` authority, path segments (literals and whole-segment
+/// variables) and a literal query. [`UriTemplate`] and `ip::IpTemplate` differ only in which
+/// variables they allow.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UriTemplate {
+pub(crate) struct Core {
     authority: String,
     segs: Vec<Seg>,
     query: Option<String>,
 }
 
-impl UriTemplate {
-    /// Parse a template of the documented subset.
-    pub fn parse(s: &str) -> Result<Self, TemplateError> {
+impl Core {
+    /// Parse a template whose only variables are from `vars`, each at most once.
+    pub(crate) fn parse(s: &str, vars: &[&'static str]) -> Result<Self, TemplateError> {
         // RFC 9298 section 2: printable ASCII only (other text must be percent-encoded).
         if s.contains('#') || !s.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
             return Err(TemplateError::Syntax);
@@ -127,22 +139,19 @@ impl UriTemplate {
         if query.as_deref().is_some_and(|q| !literal(q)) {
             return Err(TemplateError::Syntax);
         }
-        let (mut hosts, mut ports) = (0, 0);
         let mut segs = Vec::new();
+        let mut repeated = false;
         for seg in path.split('/') {
-            segs.push(match seg {
-                "{target_host}" => {
-                    hosts += 1;
-                    Seg::Host
+            let var = vars.iter().find(|v| seg == format!("{{{v}}}"));
+            segs.push(match var {
+                Some(&v) => {
+                    repeated |= segs.contains(&Seg::Var(v));
+                    Seg::Var(v)
                 }
-                "{target_port}" => {
-                    ports += 1;
-                    Seg::Port
-                }
-                _ if seg.contains("{target_host}") || seg.contains("{target_port}") => {
+                None if vars.iter().any(|v| seg.contains(&format!("{{{v}}}"))) => {
                     return Err(TemplateError::NotWholeSegment);
                 }
-                _ if seg.contains(['{', '}']) => {
+                None if seg.contains(['{', '}']) => {
                     let inner = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}'));
                     let name = inner.is_some_and(|n| {
                         !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
@@ -153,11 +162,11 @@ impl UriTemplate {
                         TemplateError::Syntax
                     });
                 }
-                _ if !literal(seg) => return Err(TemplateError::Syntax),
-                _ => Seg::Lit(seg.to_owned()),
+                None if !literal(seg) => return Err(TemplateError::Syntax),
+                None => Seg::Lit(seg.to_owned()),
             });
         }
-        if hosts != 1 || ports != 1 {
+        if repeated {
             return Err(TemplateError::Variables);
         }
         let t = Self {
@@ -166,31 +175,48 @@ impl UriTemplate {
             query,
         };
         // Literals and authority must form a valid URI once the variables are filled in.
-        t.build("x", "1").map_err(|_| TemplateError::Syntax)?;
+        let probe: Vec<_> = vars.iter().map(|&v| (v, "x")).collect();
+        t.build(&probe).map_err(|_| TemplateError::Syntax)?;
         Ok(t)
     }
 
-    /// `https://{authority}/.well-known/masque/udp/{target_host}/{target_port}/`.
-    pub fn default_for(authority: &Authority) -> Self {
+    /// The template `https://{authority}/{prefix...}/{vars...}/`.
+    pub(crate) fn default_for(
+        authority: &Authority,
+        prefix: &[&str],
+        vars: &[&'static str],
+    ) -> Self {
         Self {
             authority: authority.as_str().to_owned(),
-            segs: [".well-known", "masque", "udp"]
-                .map(|s| Seg::Lit(s.into()))
-                .into_iter()
-                .chain([Seg::Host, Seg::Port, Seg::Lit(String::new())])
+            segs: prefix
+                .iter()
+                .map(|s| Seg::Lit((*s).into()))
+                .chain(vars.iter().map(|&v| Seg::Var(v)))
+                .chain([Seg::Lit(String::new())])
                 .collect(),
             query: None,
         }
     }
 
-    fn build(&self, host: &str, port: &str) -> Result<Uri, TemplateError> {
+    /// Whether the template has the variable `name`.
+    pub(crate) fn has(&self, name: &str) -> bool {
+        self.segs
+            .iter()
+            .any(|s| matches!(s, Seg::Var(v) if *v == name))
+    }
+
+    /// The URI with each variable replaced by its (already encoded) value in `values`.
+    pub(crate) fn build(&self, values: &[(&str, &str)]) -> Result<Uri, TemplateError> {
         let mut s = format!("https://{}", self.authority);
         for seg in &self.segs {
             s.push('/');
             s.push_str(match seg {
                 Seg::Lit(l) => l,
-                Seg::Host => host,
-                Seg::Port => port,
+                Seg::Var(v) => values
+                    .iter()
+                    .find(|(n, _)| n == v)
+                    .map(|(_, val)| *val)
+                    .ok_or(TemplateError::Variables)?,
             });
         }
         if let Some(q) = &self.query {
@@ -198,6 +224,57 @@ impl UriTemplate {
             s.push_str(q);
         }
         Uri::from_str(&s).map_err(|_| TemplateError::Syntax)
+    }
+
+    /// The raw, still percent-encoded value of each variable in `uri`'s path. The scheme and
+    /// authority are not compared. Literal segments are compared byte for byte.
+    pub(crate) fn captures<'u>(
+        &self,
+        uri: &'u Uri,
+    ) -> Result<Vec<(&'static str, &'u str)>, TemplateError> {
+        if uri.query() != self.query.as_deref() {
+            return Err(TemplateError::NoMatch);
+        }
+        let path = uri.path().strip_prefix('/').ok_or(TemplateError::NoMatch)?;
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() != self.segs.len() {
+            return Err(TemplateError::NoMatch);
+        }
+        let mut out = Vec::new();
+        for (seg, part) in self.segs.iter().zip(parts) {
+            match seg {
+                Seg::Lit(l) if l == part => {}
+                Seg::Lit(_) => return Err(TemplateError::NoMatch),
+                Seg::Var(v) => out.push((*v, part)),
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// A parsed template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UriTemplate(Core);
+
+const VARS: [&str; 2] = ["target_host", "target_port"];
+
+impl UriTemplate {
+    /// Parse a template of the documented subset.
+    pub fn parse(s: &str) -> Result<Self, TemplateError> {
+        let core = Core::parse(s, &VARS)?;
+        if !VARS.iter().all(|v| core.has(v)) {
+            return Err(TemplateError::Variables);
+        }
+        Ok(Self(core))
+    }
+
+    /// `https://{authority}/.well-known/masque/udp/{target_host}/{target_port}/`.
+    pub fn default_for(authority: &Authority) -> Self {
+        Self(Core::default_for(
+            authority,
+            &[".well-known", "masque", "udp"],
+            &VARS,
+        ))
     }
 
     /// The request URI for `target`. Values are percent-encoded outside RFC 3986 unreserved.
@@ -209,7 +286,10 @@ impl UriTemplate {
             TargetHost::Name(n) => encode(n),
             TargetHost::Ip(ip) => encode(&ip.to_string()),
         };
-        self.build(&host, &target.port.to_string())
+        self.0.build(&[
+            ("target_host", &host),
+            ("target_port", &target.port.to_string()),
+        ])
     }
 
     /// The target in `uri`'s path and query. The scheme and authority are not compared
@@ -217,26 +297,11 @@ impl UriTemplate {
     ///
     /// Literal segments are compared byte for byte, with no percent-decoding normalisation.
     pub fn match_target(&self, uri: &Uri) -> Result<Target, TemplateError> {
-        if uri.query() != self.query.as_deref() {
-            return Err(TemplateError::NoMatch);
-        }
-        let path = uri.path().strip_prefix('/').ok_or(TemplateError::NoMatch)?;
-        let parts: Vec<&str> = path.split('/').collect();
-        if parts.len() != self.segs.len() {
-            return Err(TemplateError::NoMatch);
-        }
-        let (mut host, mut port) = (None, None);
-        for (seg, part) in self.segs.iter().zip(parts) {
-            match seg {
-                Seg::Lit(l) if l == part => {}
-                Seg::Lit(_) => return Err(TemplateError::NoMatch),
-                Seg::Host => host = Some(part),
-                Seg::Port => port = Some(part),
-            }
-        }
+        let caps = self.0.captures(uri)?;
+        let get = |n| caps.iter().find(|(v, _)| *v == n).map(|(_, s)| *s);
         let (host, port) = (
-            host.ok_or(TemplateError::NoMatch)?,
-            port.ok_or(TemplateError::NoMatch)?,
+            get("target_host").ok_or(TemplateError::NoMatch)?,
+            get("target_port").ok_or(TemplateError::NoMatch)?,
         );
         Ok(Target::new(parse_host(host)?, parse_port(port)?))
     }
@@ -289,7 +354,7 @@ fn parse_port(s: &str) -> Result<NonZeroU16, TemplateError> {
         .ok_or(TemplateError::BadPort)
 }
 
-fn encode(s: &str) -> String {
+pub(crate) fn encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
@@ -302,7 +367,7 @@ fn encode(s: &str) -> String {
 }
 
 /// Strict percent-decoding to UTF-8; `None` on a malformed escape or invalid UTF-8.
-fn decode(s: &str) -> Option<String> {
+pub(crate) fn decode(s: &str) -> Option<String> {
     let b = s.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -329,6 +394,14 @@ mod tests {
 
     const DEFAULT: &str =
         "https://proxy.example/.well-known/masque/udp/{target_host}/{target_port}/";
+
+    #[test]
+    fn variables_display_is_protocol_neutral() {
+        assert_eq!(
+            TemplateError::Variables.to_string(),
+            "URI template variables are missing, repeated, unknown or outside the path"
+        );
+    }
 
     fn uri(s: &str) -> Uri {
         s.parse().unwrap()

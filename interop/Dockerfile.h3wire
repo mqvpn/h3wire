@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # Our side of the interop matrix: the h3wire-quinn server and client examples and the
-# h3wire-masque proxy and client examples, built from the repository root (the build
+# h3wire-masque proxy and client examples (CONNECT-UDP and CONNECT-IP), built from the repository root (the build
 # context) with the committed Cargo.lock.
 ARG DEBIAN_IMAGE=debian:trixie-slim
 ARG RUST_IMAGE=rust:1.98-slim-trixie
@@ -19,8 +19,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && install -m 755 target/release/examples/client /usr/local/bin/h3wire-client \
     && cargo build --release --locked -p h3wire-masque --example proxy --example masque-client \
     && install -m 755 target/release/examples/proxy /usr/local/bin/h3wire-masque-proxy \
-    && install -m 755 target/release/examples/masque-client /usr/local/bin/h3wire-masque-client
+    && install -m 755 target/release/examples/masque-client /usr/local/bin/h3wire-masque-client \
+    && cargo build --release --locked -p h3wire-masque --example ip-proxy --example ip-client \
+    && install -m 755 target/release/examples/ip-proxy /usr/local/bin/h3wire-ip-proxy \
+    && install -m 755 target/release/examples/ip-client /usr/local/bin/h3wire-ip-client
 
 FROM ${DEBIAN_IMAGE}
+# The CONNECT-IP examples run `ip` and `ping`; the proxy's entry script runs iptables.
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 iputils-ping iptables \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/h3wire-server /usr/local/bin/h3wire-client \
-    /usr/local/bin/h3wire-masque-proxy /usr/local/bin/h3wire-masque-client /usr/local/bin/
+    /usr/local/bin/h3wire-masque-proxy /usr/local/bin/h3wire-masque-client \
+    /usr/local/bin/h3wire-ip-proxy /usr/local/bin/h3wire-ip-client /usr/local/bin/
+COPY --chmod=755 interop/connect-ip/proxy-entry.sh /usr/local/bin/proxy-entry.sh

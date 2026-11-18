@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "h3wire-masque"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures",
@@ -405,6 +405,7 @@ dependencies = [
  "rustix",
  "sha2",
  "tokio",
+ "tokio-tun",
  "tower-service",
 ]
 
@@ -929,6 +930,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1059,9 +1070,11 @@ version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -1076,6 +1089,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.7",
+]
+
+[[package]]
+name = "tokio-tun"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5a376ac808b88a5c2665029159c7842a29806faecc3060a1b4d9b983e0a6ce1"
+dependencies = [
+ "libc",
+ "tokio",
 ]
 
 [[package]]

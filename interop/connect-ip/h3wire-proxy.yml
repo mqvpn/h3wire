@@ -1,0 +1,15 @@
+# Our proxy (h3wire-ip-proxy) in place of connect-ip-go's (interop/connect-ip/run.sh).
+# Relative paths resolve against connect-ip-go's integration/ directory.
+services:
+  proxy:
+    image: h3wire-interop-h3wire
+    entrypoint: /usr/local/bin/proxy-entry.sh
+    environment:
+      - CERT=/certs/cert.pem
+      - KEY=/certs/key.pem
+    volumes:
+      - ./proxy/cert.pem:/certs/cert.pem:ro
+      - ./proxy/key.pem:/certs/key.pem:ro
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1

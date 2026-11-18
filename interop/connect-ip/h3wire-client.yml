@@ -1,0 +1,10 @@
+# Our client (h3wire-ip-client) in place of connect-ip-go's (interop/connect-ip/run.sh).
+# Relative paths resolve against connect-ip-go's integration/ directory.
+services:
+  client:
+    image: h3wire-interop-h3wire
+    entrypoint: h3wire-ip-client
+    environment:
+      - CA=/certs/proxy.pem
+    volumes:
+      - ./proxy/cert.pem:/certs/proxy.pem:ro

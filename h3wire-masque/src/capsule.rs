@@ -20,7 +20,11 @@ pub enum CapsuleError {
     TooLarge,
     /// The stream ended inside a capsule.
     Truncated,
-    /// The value is shorter than its leading varint.
+    /// The value is shorter than its leading varint, or a CONNECT-IP value
+    /// ([`decode_address_assign`](crate::ip::decode_address_assign),
+    /// [`decode_address_request`](crate::ip::decode_address_request),
+    /// [`decode_routes`](crate::ip::decode_routes)) is truncated or invalid, or an
+    /// `ADDRESS_REQUEST` to encode is empty.
     Malformed,
 }
 
@@ -30,7 +34,7 @@ impl fmt::Display for CapsuleError {
             Self::OutOfRange => "capsule type or length out of varint range",
             Self::TooLarge => "capsule value too large",
             Self::Truncated => "stream ended inside a capsule",
-            Self::Malformed => "capsule value shorter than its leading varint",
+            Self::Malformed => "malformed capsule value",
         })
     }
 }
@@ -257,6 +261,14 @@ impl Decoder {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn malformed_display_is_protocol_neutral() {
+        assert_eq!(
+            CapsuleError::Malformed.to_string(),
+            "malformed capsule value"
+        );
+    }
 
     fn wire(caps: &[(u64, Vec<u8>)]) -> Vec<u8> {
         let mut out = BytesMut::new();

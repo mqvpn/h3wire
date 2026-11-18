@@ -15,6 +15,7 @@ use h3wire_async::upgrade::{self, Tunnel};
 use h3wire_async::{Builder, Error, ErrorKind};
 use h3wire_masque::capsule::{self, DATAGRAM};
 use h3wire_masque::client::{self, ConnectError};
+use h3wire_masque::ip::{self, IpError, IpTemplate, IpTunnel, Scope};
 use h3wire_masque::server;
 use h3wire_masque::template::{Target, TargetHost, UriTemplate};
 use h3wire_masque::{UdpError, UdpTunnel};
@@ -180,5 +181,112 @@ pub async fn raw_server_with(p: &mut Pair, reqs: &mut Reqs, resp: Response<BoxBo
 /// [`raw_server_with`] a 200: the client's `UdpTunnel` and the server's raw ends.
 pub async fn raw_server(p: &mut Pair, reqs: &mut Reqs) -> (UdpTunnel, Tunnel, Option<Datagrams>) {
     let r = raw_server_with(p, reqs, reply(200, empty())).await;
+    (r.c.unwrap(), r.st.unwrap(), r.sd)
+}
+
+// CONNECT-IP twins of the helpers above.
+
+pub fn ip_aborted(e: &IpError, code: H3Code, source: AbortSource) -> bool {
+    matches!(e, IpError::Http(e) if aborted(e, code, source))
+}
+
+/// The default CONNECT-IP template on `localhost`.
+pub fn ip_template() -> IpTemplate {
+    IpTemplate::default_for(&Authority::from_static("localhost"))
+}
+
+/// `ip::client::connect` with [`Scope::ANY`], in a task.
+pub fn spawn_ip_connect(p: &Pair) -> JoinHandle<Result<IpTunnel, ConnectError>> {
+    spawn_ip_connect_to(p, Scope::ANY)
+}
+
+pub fn spawn_ip_connect_to(p: &Pair, scope: Scope) -> JoinHandle<Result<IpTunnel, ConnectError>> {
+    let mut send = p.send.clone();
+    tokio::spawn(async move { ip::client::connect(&mut send, &ip_template(), &scope).await })
+}
+
+/// The server's tunnel for `req`: accepted, answered with `IpPending::response`.
+pub async fn ip_serve(mut req: Request<h3wire_async::body::RecvBody>, reply: Reply) -> IpTunnel {
+    let pending = ip::server::accept(&mut req, &ip_template()).unwrap();
+    reply.send(pending.response()).unwrap();
+    pending.tunnel().await.unwrap()
+}
+
+/// Client and server `IpTunnel`s of one CONNECT-IP with [`Scope::ANY`].
+pub async fn ip_pair(p: &mut Pair, reqs: &mut Reqs) -> (IpTunnel, IpTunnel) {
+    let c = spawn_ip_connect(p);
+    let (req, reply) = reqs.recv().await.unwrap();
+    let s = ip_serve(req, reply).await;
+    (c.await.unwrap().unwrap(), s)
+}
+
+/// A raw client (tunnel and datagrams, after the server's SETTINGS) and the server's
+/// `IpTunnel`.
+pub struct RawIpClient {
+    pub ct: Tunnel,
+    pub cd: Option<Datagrams>,
+    pub s: IpTunnel,
+}
+
+pub async fn raw_ip_client_with(
+    p: &mut Pair,
+    reqs: &mut Reqs,
+    req: Request<BoxBody>,
+) -> RawIpClient {
+    let resp = tokio::spawn(p.send.send_request(req));
+    let (req, reply) = reqs.recv().await.unwrap();
+    let s = ip_serve(req, reply).await;
+    let mut resp = resp.await.unwrap().unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["capsule-protocol"], "?1");
+    let cd = resp
+        .extensions()
+        .get::<DatagramSlot>()
+        .and_then(|s| s.register());
+    let ct = upgrade::on(&mut resp).await.unwrap();
+    p.send.settings().await.unwrap();
+    RawIpClient { ct, cd, s }
+}
+
+pub async fn raw_ip_client(p: &mut Pair, reqs: &mut Reqs) -> RawIpClient {
+    let req = ip::client::request(&ip_template(), &Scope::ANY).unwrap();
+    raw_ip_client_with(p, reqs, req).await
+}
+
+/// The client's `ip::client::connect` result for a hand-made server that registers
+/// datagrams, claims the upgrade and answers with `resp`; the server's upgrade (after the
+/// client's SETTINGS) and datagrams.
+pub struct RawIpServer {
+    pub c: Result<IpTunnel, ConnectError>,
+    pub st: Result<Tunnel, Error>,
+    pub sd: Option<Datagrams>,
+}
+
+pub async fn raw_ip_server_with(
+    p: &mut Pair,
+    reqs: &mut Reqs,
+    resp: Response<BoxBody>,
+) -> RawIpServer {
+    let c = spawn_ip_connect(p);
+    let (mut req, reply) = reqs.recv().await.unwrap();
+    let sd = req
+        .extensions()
+        .get::<DatagramSlot>()
+        .and_then(|s| s.register());
+    let on = upgrade::on(&mut req);
+    let info = req.extensions().get::<ConnInfo>().unwrap().clone();
+    reply.send(resp).unwrap();
+    let st = on.await;
+    info.settings().await.unwrap();
+    RawIpServer {
+        c: c.await.unwrap(),
+        st,
+        sd,
+    }
+}
+
+/// [`raw_ip_server_with`] a 200: the client's `IpTunnel` and the server's raw ends.
+pub async fn raw_ip_server(p: &mut Pair, reqs: &mut Reqs) -> (IpTunnel, Tunnel, Option<Datagrams>) {
+    let r = raw_ip_server_with(p, reqs, reply(200, empty())).await;
     (r.c.unwrap(), r.st.unwrap(), r.sd)
 }

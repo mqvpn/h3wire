@@ -26,11 +26,14 @@ use std::future::Future;
 pub enum Reject {
     /// Not a CONNECT-UDP request; it is untouched, route it elsewhere.
     NotConnectUdp,
-    /// A malformed CONNECT-UDP request: already aborted with `H3_MESSAGE_ERROR`; any
-    /// response the service returns is discarded.
+    /// Not a CONNECT-IP request (from [`ip::server::accept`](crate::ip::server::accept));
+    /// it is untouched, route it elsewhere.
+    NotConnectIp,
+    /// A malformed CONNECT-UDP or CONNECT-IP request: already aborted with
+    /// `H3_MESSAGE_ERROR`; any response the service returns is discarded.
     Malformed,
-    /// Return a response with this status: 400 for a bad target, 404 for a path that
-    /// does not fit the template.
+    /// Return a response with this status: 400 for a bad CONNECT-UDP target, 404 for a
+    /// path that does not fit the template.
     Status(StatusCode),
 }
 

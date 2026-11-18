@@ -11,8 +11,17 @@
 use arbitrary::{Arbitrary, Unstructured};
 use h3wire::FieldRef;
 use h3wire_fuzz::{IDS, Op, WireOp};
+use h3wire_masque::ip::{
+    AssignedAddress, IpPrefix, IpRange, IpTemplate, RequestedAddress, encode_address_assign,
+    encode_address_request, encode_routes,
+};
+use http::Uri;
 use std::fmt::Debug;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
+
+#[path = "../../h3wire-masque/tests/packets/mod.rs"]
+mod packets;
 
 /// The `arbitrary` 1.4 encoding of a value.
 trait Enc {
@@ -639,6 +648,166 @@ fn template_seeds() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
+fn ip(s: &str) -> IpAddr {
+    s.parse().unwrap()
+}
+
+/// The value of the capsule an `encode_*` call appended (1-byte type, varint length).
+fn value(f: impl FnOnce(&mut bytes::BytesMut)) -> Vec<u8> {
+    let mut out = bytes::BytesMut::new();
+    f(&mut out);
+    let n = 1 << (out[1] >> 6);
+    out[1 + n..].to_vec()
+}
+
+/// A selector byte (type mod 3), then a valid capsule value of each type.
+fn ip_capsule_seeds() -> Vec<(&'static str, Vec<u8>)> {
+    let p4 = IpPrefix::new(ip("192.0.2.0"), 24).unwrap();
+    let p6 = IpPrefix::new(ip("2001:db8::"), 64).unwrap();
+    let assign = value(|o| {
+        let rejected = AssignedAddress::rejection(7.try_into().unwrap(), false);
+        let list = [
+            AssignedAddress {
+                request_id: 0,
+                prefix: p4,
+            },
+            AssignedAddress {
+                request_id: 3,
+                prefix: p6,
+            },
+            rejected,
+        ];
+        encode_address_assign(&list, o).unwrap();
+    });
+    let request = value(|o| {
+        let list = [
+            RequestedAddress {
+                request_id: 1.try_into().unwrap(),
+                prefix: p4,
+            },
+            RequestedAddress {
+                request_id: 2.try_into().unwrap(),
+                prefix: p6,
+            },
+        ];
+        encode_address_request(&list, o).unwrap();
+    });
+    let routes = value(|o| {
+        let r = |a, b, p| IpRange::new(ip(a), ip(b), p).unwrap();
+        let list = [
+            r("0.0.0.0", "255.255.255.255", 0),
+            r("::", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", 6),
+        ];
+        encode_routes(&list, o).unwrap();
+    });
+    let with = |k: u8, b: &[u8]| [&[k][..], b].concat();
+    vec![
+        ("assign", with(0, &assign)),
+        ("request", with(1, &request)),
+        ("routes", with(2, &routes)),
+        ("assign_empty", with(0, &[])),
+        ("routes_truncated", with(2, &routes[..routes.len() - 3])),
+    ]
+}
+
+/// `template`, a NUL byte, then a request URI, for `ip_template`.
+fn ip_template_seeds() -> Vec<(&'static str, Vec<u8>)> {
+    let with = |tpl: &str, uri: &str| [tpl.as_bytes(), b"\0", uri.as_bytes()].concat();
+    let default = "https://proxy.example/.well-known/masque/ip/{target}/{ipproto}/";
+    let vpn = "https://proxy.example/vpn/{target}/{ipproto}";
+    let p = "/.well-known/masque/ip";
+    let seeds = vec![
+        ("default_any", with(default, &format!("{p}/*/*/"))),
+        (
+            "default_prefix",
+            with(default, &format!("{p}/192.0.2.0%2F24/6/")),
+        ),
+        (
+            "default_v6",
+            with(default, &format!("{p}/2001%3Adb8%3A%3A%2F32/58/")),
+        ),
+        (
+            "default_host",
+            with(default, &format!("{p}/host.example/17/")),
+        ),
+        ("vpn_any", with(vpn, "/vpn/*/*")),
+        ("vpn_prefix", with(vpn, "/vpn/198.51.100.7/1")),
+    ];
+    // Every seed is meant to match: one that no longer parses or matches would be dead.
+    for (name, bytes) in &seeds {
+        let i = bytes.iter().position(|&b| b == 0).unwrap();
+        let tpl = IpTemplate::parse(std::str::from_utf8(&bytes[..i]).unwrap());
+        let uri = std::str::from_utf8(&bytes[i + 1..])
+            .unwrap()
+            .parse::<Uri>()
+            .unwrap();
+        let scope = tpl.unwrap().match_scope(&uri);
+        println!("ip_template/{name}: parse ok, match {scope:?}");
+        assert!(scope.is_ok(), "ip_template/{name} does not match");
+    }
+    seeds
+}
+
+/// `Input` of `ip_policy`: `arbitrary` 1.4 reads the lists and options from the front and
+/// the packet (a `&[u8]`, last field) from the rest. Rules: both sides hold one host
+/// prefix per family and a route over every address.
+fn ip_policy_seeds() -> Vec<(&'static str, Vec<u8>)> {
+    use packets::*;
+    let (a, b) = (ip("192.0.2.1"), ip("198.51.100.9"));
+    let (a6, b6) = (ip("2001:db8::1"), ip("2001:db8::2"));
+    let (v6a, v6b) = (Ipv6Addr::LOCALHOST, Ipv6Addr::UNSPECIFIED);
+    let (v4a, v4b) = (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2));
+    let tcp = packet(a, b, 6, &[0; 20]);
+    let quote = packet(b, a, 6, &[0; 8]);
+    let packets: Vec<(&str, Vec<u8>)> = vec![
+        ("tcp", tcp.clone()),
+        ("tcp_v6", packet(a6, b6, 6, &[0; 20])),
+        ("fragment", ipv4_frag(v4a, v4b, 17, 8, &[0; 16])),
+        ("fragment_v6", ipv6_fragment(v6a, v6b, 6, 1, &[0; 16])),
+        (
+            "ext_chain",
+            ipv6_chain(v6a, v6b, &[0, 60, 51, 44], 6, &[0; 20]),
+        ),
+        ("icmp_error", unreachable(b, a, &quote)),
+        ("icmp_error_cut", unreachable(b, a, &quote[..12])),
+        (
+            "icmp_error_v6",
+            unreachable(b6, a6, &packet(a6, b6, 17, &[0; 8])),
+        ),
+        ("echo", echo_request(a, b)),
+        ("truncated", tcp[..15].to_vec()),
+    ];
+    let addr = |v6: bool, bits: u128| [vec![u8::from(v6)], bits.to_le_bytes().to_vec()].concat();
+    let host = |x: IpAddr| match x {
+        IpAddr::V4(x) => [addr(false, u32::from(x).into()), vec![32]].concat(),
+        IpAddr::V6(x) => [addr(true, x.into()), vec![128]].concat(),
+    };
+    let list = |items: Vec<Vec<u8>>| {
+        let mut out: Vec<u8> = items
+            .into_iter()
+            .flat_map(|i| [vec![1], i].concat())
+            .collect();
+        out.push(0);
+        out
+    };
+    let full = list(vec![
+        [addr(false, 0), addr(false, u32::MAX.into()), vec![0]].concat(),
+        [addr(true, 0), addr(true, u128::MAX), vec![0]].concat(),
+    ]);
+    let rules = [
+        list(vec![host(a), host(a6)]),
+        full.clone(),
+        list(vec![host(b), host(b6)]),
+        full,
+        vec![0, 0, 0], // no target, no protocol, not the proxy
+    ]
+    .concat();
+    packets
+        .into_iter()
+        .map(|(n, p)| (n, [rules.clone(), p].concat()))
+        .collect()
+}
+
 fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("seeds");
     let targets = [
@@ -648,6 +817,9 @@ fn main() {
         ("api_ops", api_seeds()),
         ("capsule_decoder", capsule_seeds()),
         ("template_match", template_seeds()),
+        ("ip_capsule", ip_capsule_seeds()),
+        ("ip_template", ip_template_seeds()),
+        ("ip_policy", ip_policy_seeds()),
     ];
     for (target, seeds) in targets {
         let dir = root.join(target);

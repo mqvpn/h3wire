@@ -1,0 +1,18 @@
+# Every CONNECT-IP cell (interop/connect-ip/run.sh).
+services:
+  client:
+    # Compose passes a variable into a container only when the service names it.
+    environment:
+      - REQUEST_ADDRS=${REQUEST_ADDRS:-}
+    # The server's run.sh points its default route at the proxy before it starts
+    # listening; echoes sent before that are answered via the Docker gateway and lost.
+    # Upstream's client happens to start late enough; ours does not.
+    depends_on:
+      server:
+        condition: service_healthy
+  server:
+    healthcheck:
+      test: ["CMD-SHELL", "ss -ltn | grep -q ':80 '"]
+      interval: 200ms
+      timeout: 1s
+      retries: 100
