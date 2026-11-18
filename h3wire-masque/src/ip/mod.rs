@@ -6,6 +6,7 @@ mod capsule;
 mod policy;
 mod prefix;
 mod template;
+mod tunnel;
 
 pub use capsule::{
     ADDRESS_ASSIGN, ADDRESS_REQUEST, AssignedAddress, MAX_CONTROL_CAPSULE, ROUTE_ADVERTISEMENT,
@@ -15,3 +16,4 @@ pub use capsule::{
 pub use policy::{DropReason, Drops, Policy, Rules};
 pub use prefix::{IpPrefix, IpRange, PrefixError};
 pub use template::{IpTemplate, Scope, ScopeTarget};
+pub use tunnel::{IpError, IpEvent, MAX_IP_PACKET};
