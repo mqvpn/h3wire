@@ -33,8 +33,9 @@ pub fn request<B: Default>(
 
 /// Open a CONNECT-IP tunnel for `scope`: request, response, validation, upgrade, then the
 /// peer's SETTINGS (to choose the carrier). A non-2xx response is
-/// [`ConnectError::Rejected`] and no tunnel exists; dropping that response before the end
-/// of its body cancels the request with `H3_REQUEST_CANCELLED`.
+/// [`ConnectError::Rejected`] and no tunnel exists: the error carries the response, whose
+/// body can be read, and the request side is already finished. Dropping the response
+/// before the end of its body cancels the stream with `H3_REQUEST_CANCELLED`.
 #[allow(clippy::result_large_err)] // `Rejected` hands the response back unboxed
 pub async fn connect<B>(
     send: &mut SendRequest<B>,

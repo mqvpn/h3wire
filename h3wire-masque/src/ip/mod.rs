@@ -8,6 +8,117 @@
 //! exists only once the response has been sent, so awaiting it inside the service
 //! deadlocks.
 //!
+//! # What the library checks
+//!
+//! Every received packet is judged by a [`Policy`]. With the default,
+//! [`Policy::Enforce`], the IP header must parse and its lengths agree; the source must be
+//! an address this end assigned to the peer or lie in a route it accepted from the peer;
+//! the destination must be an address the peer assigned to this end (and this end
+//! accepted) or lie in a route this end advertised that covers the packet's protocol;
+//! the request's `target` and `ipproto` hold; and an ICMP error must
+//! quote a packet the receiver could have sent. A refused packet is dropped and counted
+//! ([`drops`](IpTunnel::drops)); it never aborts the tunnel. RFC 9484 section 7.2 leaves
+//! such checks to local policy ("a forwarding error, not a protocol violation"), so this
+//! is a library default, not an RFC requirement. Until the first capsule sets addresses
+//! and routes, optimistic packets are dropped.
+//!
+//! What the peer assigns and advertises are offers: they count for the policy only after
+//! [`accept_assigned`](IpTunnel::accept_assigned) and
+//! [`accept_routes`](IpTunnel::accept_routes). A new offer withdraws accepted items it no
+//! longer covers. Your own [`assign`](IpTunnel::assign) and
+//! [`advertise`](IpTunnel::advertise) take effect once the stream took the capsule;
+//! `assign` and `advertise` send the full list, and an empty list withdraws everything.
+//!
+//! [`Policy::Unchecked`] (through [`set_policy`](IpTunnel::set_policy)) turns off the
+//! address and route checks, for addresses configured out of band. It keeps header
+//! validation, the request scope and the checks on an ICMP error's quotation.
+//!
+//! # Shared addresses
+//!
+//! [`check_outgoing`](IpTunnel::check_outgoing) says whether the peer's rules admit a
+//! packet from here. It is an eligibility filter, not a tunnel selector: `send` does not
+//! apply it, and it cannot tell apart traffic that two tunnels' scopes both admit (an
+//! ICMP echo reply to an address two clients share). An application that shares
+//! addresses between tunnels MUST run it on every candidate tunnel and MUST resolve
+//! several eligible tunnels itself, by giving each tunnel distinct addresses, by bounded
+//! flow tracking, or by dropping the packet. It must never broadcast to them: RFC 9484
+//! section 11 allows a proxy to forward ICMP on a shared address only to the client whose
+//! scope matches the quoted packet.
+//!
+//! # Other points to know
+//!
+//! - Offers must be accepted before they count (above).
+//! - Packets in `fe80::/10` or to `ff02::/16` pass the policy, so that link-local probes
+//!   and replies work. The application must not forward them beyond the tunnel (RFC 9484
+//!   section 7.2).
+//! - Every [`IpEvent::AddressRequest`] is the application's to answer with
+//!   [`assign`](IpTunnel::assign): one entry per request ID, either an assignment or an
+//!   [`AssignedAddress::rejection`]. `assign` replaces the full list, so repeat the
+//!   addresses assigned earlier, with request ID 0.
+//! - IPv6 needs a tunnel MTU of at least 1,280 bytes. With the datagram carrier, set the
+//!   transport's initial MTU so that such a packet fits (quinn:
+//!   `TransportConfig::initial_mtu(1350)`). If an IPv6 send is refused while
+//!   [`max_payload`](IpTunnel::max_payload) is below 1,280, the tunnel aborts the stream
+//!   with `H3_DATAGRAM_ERROR` and the send returns [`IpError::MtuTooSmall`].
+//! - A [`ScopeTarget::Host`] target must be resolved by the application before the
+//!   response is returned; the library does not resolve names.
+//! - Return [`IpPending::response`](server::IpPending::response) first, then spawn
+//!   [`IpPending::tunnel`](server::IpPending::tunnel).
+//!
+//! # RFC 9484 duties left to the application
+//!
+//! - An endpoint that needs an address assigned MUST send an `ADDRESS_REQUEST`
+//!   ([`request`](IpTunnel::request); section 4.7.1).
+//! - The proxy MUST keep the assignments and routes for as long as the request stream is
+//!   open, and MUST close the stream when it tears the tunnel down, for instance after
+//!   inactivity (section 4.1).
+//! - Unless both transports are configured to guarantee an IPv6 MTU of 1,280 bytes, the
+//!   application MUST send an ICMPv6 echo request with 1,232 bytes of data and tear the
+//!   tunnel down when no reply comes (section 7.2). The library sends no probe; its
+//!   policy lets the probe and the reply through.
+//! - Decrementing the hop limit on encapsulation (section 7.2) and generating ICMP
+//!   errors, Packet Too Big included (sections 7.2.1 and 10.1, SHOULD), belong to the IP
+//!   stack behind the tunnel.
+//! - Under [`Policy::Unchecked`], source address validation is the application's
+//!   (section 11 requires following BCP 38 wherever an endpoint knows the prefixes its
+//!   peer may send from).
+//! - A rejected request ([`ConnectError::Rejected`](crate::client::ConnectError::Rejected))
+//!   is over and never a tunnel: the client treats it as failed (sections 4.1 and 4.5).
+//!   The error carries the response, whose body can be read; the request side is already
+//!   finished, and dropping the response before the end of its body cancels the stream
+//!   with `H3_REQUEST_CANCELLED`.
+//!
+//! A client opens a tunnel, asks for an address and accepts what the proxy offers:
+//!
+//! ```no_run
+//! use bytes::Bytes;
+//! use h3wire_async::SendRequest;
+//! use h3wire_masque::ip::{self, IpEvent, IpPrefix, IpTemplate, Scope};
+//! use http_body_util::Empty;
+//!
+//! async fn client(send: &mut SendRequest<Empty<Bytes>>) -> Result<(), Box<dyn std::error::Error>> {
+//!     let template = IpTemplate::parse("https://proxy.example/vpn/{target}/{ipproto}/")?;
+//!     let mut tunnel = ip::client::connect(send, &template, &Scope::ANY).await?;
+//!     // 0.0.0.0/32: any IPv4 address.
+//!     tunnel.request(&[IpPrefix::new([0; 4].into(), 32)?]).await?;
+//!     while let Some(event) = tunnel.recv().await? {
+//!         match event {
+//!             IpEvent::AddressAssign(list) => {
+//!                 let mine: Vec<_> = list.iter().filter(|a| !a.is_rejection()).map(|a| a.prefix).collect();
+//!                 tunnel.accept_assigned(&mine)?;
+//!             }
+//!             IpEvent::Routes(routes) => tunnel.accept_routes(&routes)?,
+//!             // Hand the packet to the TUN device.
+//!             IpEvent::Packet(_) => {}
+//!             _ => {}
+//!         }
+//!     }
+//!     Ok(())
+//! }
+//! ```
+//!
+//! A proxy, sketched as a service:
+//!
 //! ```no_run
 //! use bytes::Bytes;
 //! use h3wire_async::body::RecvBody;
