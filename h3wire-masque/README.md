@@ -29,10 +29,10 @@ matrix is in
 - **Shared addresses.** `check_outgoing` is an eligibility filter, not a tunnel selector.
   An application that shares addresses MUST run it on every candidate tunnel and MUST
   resolve several eligible tunnels itself (distinct addresses, bounded flow tracking, or
-  dropping the packet), never broadcast. A non-first fragment carries no ICMP header and
-  no quotation, so the policy judges it by addresses and scope only: a proxy that shares
-  an address and forwards ICMP must drop non-first ICMP fragments or reassemble before the
-  check (section 11).
+  dropping the packet), never broadcast. A non-first fragment carries neither the ICMP
+  header nor the quoted packet's headers, so the policy judges it by addresses and scope
+  only: a proxy that shares an address and forwards ICMP must drop non-first ICMP
+  fragments or reassemble before the check (section 11).
 - **Link-scoped packets.** Packets to `fe80::/10` or `ff02::/16`, and packets from a
   link-local source to an assigned address, pass the destination and target checks (a
   link-local source passes the source check for them), so link-local probes and replies

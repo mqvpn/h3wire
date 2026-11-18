@@ -298,7 +298,8 @@ impl IpSender {
     /// carrier never falls back to a capsule; the capsule carrier waits for stream credit.
     /// An IPv6 packet the datagram carrier refuses while the datagram limit is known and a
     /// 1,280-byte packet does not fit in a datagram aborts the stream with
-    /// `H3_DATAGRAM_ERROR` and returns `MtuTooSmall` (RFC 9484 section 7.2). Cancel-safe: a dropped pending send wrote nothing.
+    /// `H3_DATAGRAM_ERROR` and returns `MtuTooSmall` (RFC 9484 section 7.2). Cancel-safe:
+    /// a dropped pending send wrote nothing.
     pub async fn send(&mut self, packet: Bytes) -> Result<(), IpError> {
         if !matches!(packet.first().map(|b| b >> 4), Some(4 | 6)) {
             return Err(IpError::Malformed);

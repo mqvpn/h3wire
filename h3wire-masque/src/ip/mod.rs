@@ -49,11 +49,11 @@
 //! section 11 allows a proxy to forward ICMP on a shared address only to the client whose
 //! scope matches the quoted packet.
 //!
-//! A non-first fragment carries no ICMP header and no quotation, so the policy judges it
-//! by its addresses and the request scope only. A proxy that shares an address between
-//! clients and forwards ICMP must therefore drop non-first ICMP fragments, or reassemble
-//! before the check: only the first fragment holds the invoking packet that section 11
-//! requires it to inspect.
+//! A non-first fragment carries neither the ICMP header nor the quoted packet's headers,
+//! so the policy judges it by its addresses and the request scope only. A proxy that
+//! shares an address between clients and forwards ICMP must therefore drop non-first ICMP
+//! fragments, or reassemble before the check: only the first fragment holds the headers
+//! of the invoking packet that section 11 requires it to inspect.
 //!
 //! # Other points to know
 //!
@@ -95,9 +95,9 @@
 //!   (section 11 requires following BCP 38 wherever an endpoint knows the prefixes its
 //!   peer may send from).
 //! - The ECN and DSCP rules (sections 10.2 and 10.3: Not-ECT outside congestion control,
-//!   no copying of the inner DSCP, no coalescing of differently marked packets) bind the
-//!   QUIC sender's outer packets and IP headers, which this library never touches: they
-//!   are the transport's.
+//!   no copying of the inner DSCP under congestion control, no coalescing of differently
+//!   marked packets) bind the QUIC sender's outer packets and IP headers, which this
+//!   library never touches: they are the transport's.
 //!
 //! A client opens a tunnel, asks for an address and accepts what the proxy offers:
 //!

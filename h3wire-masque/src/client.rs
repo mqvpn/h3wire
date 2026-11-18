@@ -14,7 +14,7 @@ use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body::Body;
 use std::fmt;
 
-/// Why [`connect`] failed.
+/// Why [`connect`] or [`ip::client::connect`](crate::ip::client::connect) failed.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ConnectError {
@@ -22,9 +22,9 @@ pub enum ConnectError {
     Template(TemplateError),
     /// The request or the connection failed.
     Http(Error),
-    /// A non-2xx response to a CONNECT-UDP request, to read. Read it to the end or drop it
-    /// promptly: holding it unread keeps the request open, and the client must abort a
-    /// failed request (RFC 9298 section 3.1).
+    /// A non-2xx response to a CONNECT-UDP request, with its body. The client must abort a
+    /// failed request (RFC 9298 section 3.1): dropping this response does that, so drop it
+    /// once you have read what you need. Holding it keeps the request open.
     Rejected(Response<RecvBody>),
     /// A non-2xx response to a CONNECT-IP request: its status and headers. The request
     /// was aborted (RFC 9484 sections 4.1 and 4.5), so there is no body to read.
