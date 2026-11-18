@@ -6,6 +6,7 @@ use super::{IpPrefix, IpRange, Scope, ScopeTarget};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Whether a tunnel authorizes packets by address and route.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Policy {
     /// Check sources and destinations against the assigned addresses and the routes.
