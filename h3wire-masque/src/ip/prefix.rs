@@ -108,7 +108,7 @@ impl IpPrefix {
         self.len <= other.len && self.contains(other.addr)
     }
 
-    fn bounds(&self) -> (u128, u128) {
+    pub(super) fn bounds(&self) -> (u128, u128) {
         let (width, n) = num(self.addr);
         (n, n | host_mask(width - self.len))
     }

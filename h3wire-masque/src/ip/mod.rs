@@ -220,6 +220,7 @@ pub mod client;
 mod policy;
 mod prefix;
 pub mod server;
+mod set;
 mod template;
 mod tunnel;
 
@@ -230,5 +231,7 @@ pub use capsule::{
 };
 pub use policy::{DropReason, Drops, Policy, Rules};
 pub use prefix::{IpPrefix, IpRange, PrefixError};
+#[doc(hidden)]
+pub use set::{AddrSet, RouteSet};
 pub use template::{IpTemplate, Scope, ScopeTarget};
 pub use tunnel::{IpError, IpEvent, IpReceiver, IpSender, IpTunnel, MAX_IP_PACKET};

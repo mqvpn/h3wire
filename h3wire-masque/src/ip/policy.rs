@@ -2,7 +2,7 @@
 // Copyright (c) 2026 mp0rta
 //! Which IP packets may enter or leave a CONNECT-IP tunnel (RFC 9484 sections 4.6, 4.7, 7, 11).
 
-use super::{IpPrefix, IpRange, Scope, ScopeTarget};
+use super::{AddrSet, RouteSet, Scope, ScopeTarget};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Whether a tunnel authorizes packets by address and route.
@@ -61,13 +61,13 @@ pub struct Drops {
 #[derive(Debug, Clone, Copy)]
 pub struct Rules<'a> {
     /// *A*: the prefixes I assigned to the peer.
-    pub assigned: &'a [IpPrefix],
+    pub assigned: &'a AddrSet,
     /// *R*: the ranges I advertised.
-    pub routes: &'a [IpRange],
+    pub routes: &'a RouteSet,
     /// *A'*: the peer's assignments to me that I accepted.
-    pub peer_assigned: &'a [IpPrefix],
+    pub peer_assigned: &'a AddrSet,
     /// *R'*: the peer's routes that I accepted.
-    pub peer_routes: &'a [IpRange],
+    pub peer_routes: &'a RouteSet,
     /// The request scope.
     pub scope: &'a Scope,
     /// Whether this endpoint is the proxy.
@@ -123,7 +123,7 @@ impl Rules<'_> {
     fn check(&self, src: IpAddr, dst: IpAddr, proto: Option<u8>) -> Result<(), DropReason> {
         let icmp = is_icmp(dst, proto);
         let link_dst = is_link_local(dst) || is_ff02(dst);
-        let dst_assigned = self.peer_assigned.iter().any(|p| p.contains(dst));
+        let dst_assigned = self.peer_assigned.contains(dst);
         let link_scoped = link_dst || (is_link_local(src) && dst_assigned);
 
         if self
@@ -144,8 +144,8 @@ impl Rules<'_> {
         }
 
         // Route protocol does not restrict sources: it describes traffic sent to a range.
-        let src_ok = self.assigned.iter().any(|p| p.contains(src))
-            || self.peer_routes.iter().any(|r| r.contains(src))
+        let src_ok = self.assigned.contains(src)
+            || self.peer_routes.contains(src)
             || (is_link_local(src) && link_scoped);
         if !src_ok {
             return Err(DropReason::Source);
@@ -153,18 +153,15 @@ impl Rules<'_> {
         if link_dst || dst_assigned {
             return Ok(());
         }
-        let mut covered = false;
-        for r in self.routes.iter().filter(|r| r.contains(dst)) {
-            if r.ipproto() == 0 || Some(r.ipproto()) == proto || icmp {
-                return Ok(());
-            }
-            covered = true;
-        }
-        Err(if covered {
-            DropReason::Protocol
+        if self.routes.allows(dst, proto) {
+            Ok(())
+        } else if !self.routes.contains(dst) {
+            Err(DropReason::Destination)
+        } else if icmp {
+            Ok(())
         } else {
-            DropReason::Destination
-        })
+            Err(DropReason::Protocol)
+        }
     }
 }
 

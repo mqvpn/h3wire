@@ -3,7 +3,7 @@
 #![no_main]
 
 use arbitrary::Arbitrary;
-use h3wire_masque::ip::{IpPrefix, IpRange, Policy, Rules, Scope, ScopeTarget};
+use h3wire_masque::ip::{AddrSet, IpPrefix, IpRange, Policy, RouteSet, Rules, Scope, ScopeTarget};
 use libfuzzer_sys::fuzz_target;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -73,8 +73,8 @@ struct Input<'a> {
 // No panic; whatever Enforce accepts, Unchecked accepts; outgoing is incoming on the
 // peer's view.
 fuzz_target!(|i: Input| {
-    let prefixes = |v: &[Prefix]| v.iter().map(Prefix::build).collect::<Vec<_>>();
-    let ranges = |v: &[Range]| v.iter().map(Range::build).collect::<Vec<_>>();
+    let prefixes = |v: &[Prefix]| AddrSet::new(v.iter().map(Prefix::build).collect());
+    let ranges = |v: &[Range]| RouteSet::new(v.iter().map(Range::build).collect());
     let (a, r) = (prefixes(&i.assigned), ranges(&i.routes));
     let (pa, pr) = (prefixes(&i.peer_assigned), ranges(&i.peer_routes));
     let scope = Scope {
