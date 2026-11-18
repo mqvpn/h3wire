@@ -42,7 +42,15 @@ pub enum ScopeTarget {
     Any,
     /// An IP address or prefix.
     Prefix(IpPrefix),
-    /// A host name.
+    /// A host name: an RFC 3986 `reg-name` without percent-escapes, so only unreserved
+    /// (`A-Z a-z 0-9 - . _ ~`) and sub-delim (`! $ & ' ( ) * + , ; =`) characters. An
+    /// internationalised name is carried as A-labels. `match_scope` rejects anything else
+    /// as `BadTarget`; `expand` does too, and also rejects `*` and IP-address literals.
+    ///
+    /// The library checks only the character set and enforces no host scope. A matched name
+    /// is unvalidated peer input: it may be something a resolver reads as a numeric address
+    /// (`127.1`, `010.0.0.1`) or a dot-segment (`.`, `..`). Resolve and authorise it under
+    /// the proxy's own policy before use.
     Host(String),
 }
 
@@ -105,8 +113,7 @@ impl IpTemplate {
     }
 }
 
-/// RFC 3986 `reg-name` without escapes: unreserved or sub-delims only. Internationalised names
-/// are sent as A-labels.
+// The accepted form is documented on `ScopeTarget::Host`.
 fn reg_name(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
