@@ -3,9 +3,7 @@
 #![no_main]
 
 use arbitrary::Arbitrary;
-use h3wire_masque::ip::{
-    AddrSet, IpPrefix, IpRange, Policy, RouteSet, Rules, Scope, ScopeTarget,
-};
+use h3wire_masque::ip::{AddrSet, IpPrefix, IpRange, Policy, RouteSet, Rules, Scope, ScopeTarget};
 use libfuzzer_sys::fuzz_target;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
