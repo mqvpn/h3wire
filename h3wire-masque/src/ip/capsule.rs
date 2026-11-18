@@ -124,6 +124,9 @@ fn encode_addresses(
 ) -> Result<(), CapsuleError> {
     let mut v = Vec::new();
     for (id, p) in entries {
+        if id > varint::MAX {
+            return Err(CapsuleError::OutOfRange);
+        }
         put_varint(id, &mut v);
         put_addr(p.addr(), &mut v);
         v.push(p.prefix_len());
@@ -434,6 +437,28 @@ mod tests {
         assert_eq!(decode_routes(&r).unwrap_err(), m);
         r[4] = 1;
         assert!(decode_routes(&r).is_ok());
+    }
+
+    #[test]
+    fn request_id_beyond_varint_rejected() {
+        let mut o = BytesMut::from(&b"x"[..]);
+        let a = AssignedAddress {
+            request_id: u64::MAX,
+            prefix: pfx("192.0.2.1", 32),
+        };
+        assert_eq!(
+            encode_address_assign(&[a], &mut o),
+            Err(CapsuleError::OutOfRange)
+        );
+        let r = RequestedAddress {
+            request_id: nz(u64::MAX),
+            prefix: pfx("192.0.2.1", 32),
+        };
+        assert_eq!(
+            encode_address_request(&[r], &mut o),
+            Err(CapsuleError::OutOfRange)
+        );
+        assert_eq!(&o[..], b"x");
     }
 
     #[test]
