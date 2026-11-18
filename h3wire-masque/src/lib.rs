@@ -69,6 +69,7 @@
 #![warn(missing_docs)]
 
 pub mod capsule;
+mod carrier;
 pub mod client;
 pub mod server;
 pub mod template;
