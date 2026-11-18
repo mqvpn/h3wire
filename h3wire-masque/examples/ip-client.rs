@@ -15,14 +15,14 @@
 //! 1280), and relays packets between the device and the tunnel. Address requests from
 //! the proxy are rejected (it has no pool).
 //!
-//! With `REQUEST_ADDRS` (comma-separated prefixes, at least two) it then requests them
-//! and requires the answer to assign the first and reject the second, printing
-//! `address-request: ok ids=<a>,<b>`. Then it runs `TESTCASE`: `ping` (50 echo requests
-//! to `SERVER_ADDR`, passing only if all 50 were sent and answered, as connect-ip-go's
-//! client requires) or `http` (`GET /hello` from `SERVER_ADDR` port 80, which must
-//! return `Hello, World!\n`). The exit status is the test's. It refuses to run the test
-//! when no advertised route contains `SERVER_ADDR`, since the traffic would then bypass
-//! the tunnel.
+//! With `REQUEST_ADDRS` (comma-separated prefixes, at least two; empty is unset) it then
+//! requests them and requires the answer to assign the first and reject the second,
+//! printing `address-request: ok ids=<a>,<b>`. Then it runs `TESTCASE`: `ping` (50
+//! echo requests to `SERVER_ADDR`, passing only if all 50 were sent and answered, as
+//! connect-ip-go's client requires) or `http` (`GET /hello` from `SERVER_ADDR` port 80,
+//! which must return `Hello, World!\n`). The exit status is the test's. It refuses to
+//! run the test when no advertised route contains `SERVER_ADDR`, since the traffic
+//! would then bypass the tunnel.
 //!
 //! Needs `CAP_NET_ADMIN`, `ip` from iproute2 and `ping`. Linux only: elsewhere it exits
 //! with an error.
@@ -91,7 +91,8 @@ mod linux {
         let bad = |k: &str| format!("{k}: invalid value");
         let port: u16 = var("PROXY_PORT")?.parse().map_err(|_| bad("PROXY_PORT"))?;
         let template = env("TEMPLATE").unwrap_or(format!("https://proxy:{port}/vpn"));
-        let request = match env("REQUEST_ADDRS") {
+        // Set but empty is unset (compose passes the variable to every cell).
+        let request = match env("REQUEST_ADDRS").filter(|s| !s.is_empty()) {
             None => None,
             Some(s) => {
                 let v: Vec<_> = s
@@ -573,6 +574,10 @@ mod linux {
                 c.request,
                 Some(vec![pfx("2001:db8:1::10/128"), pfx("2001:db8:1::99/128")])
             );
+            // Set but empty, as compose passes `REQUEST_ADDRS=${REQUEST_ADDRS:-}`: no request.
+            let mut e = V4.to_vec();
+            e.push(("REQUEST_ADDRS", ""));
+            assert_eq!(config(env(&e)).unwrap().request, None);
             for (k, v) in [
                 ("PROXY_ADDR", "proxy"),
                 ("PROXY_PORT", "x"),
