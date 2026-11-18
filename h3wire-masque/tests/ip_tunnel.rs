@@ -21,9 +21,10 @@ use h3wire_masque::ip::{
 use std::future::Future;
 use std::net::IpAddr;
 use std::num::NonZeroU64;
-use std::pin::pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::pin::{Pin, pin};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Wake, Waker};
 use std::time::Duration;
 use support::*;
 
@@ -974,11 +975,8 @@ async fn packet_sender_from_many_tasks() {
         let e = s.recv().await.unwrap_err();
         assert!(ip_aborted(&e, RC, AbortSource::Peer), "{e:?}");
 
-        // Capsules: admission only into an empty send queue, so the senders wait for
-        // credit together.
-        let mut cb = Builder::new();
-        cb.send_capacity(1);
-        let (mut p, mut reqs) = masque_over(conns_no_datagrams().await, &cb).await;
+        // Capsules, with senders waiting for credit.
+        let (mut p, mut reqs) = tight_masque().await;
         let (mut c, mut s) = ip_pair(&mut p, &mut reqs).await;
         assert_eq!(c.carrier(), Carrier::Capsule);
         setup(&mut c, &mut s).await;
@@ -1015,27 +1013,96 @@ async fn full_stream(p: &mut Pair, reqs: &mut Reqs) -> (IpTunnel, IpTunnel, IpPa
     (c, s, h, sent)
 }
 
-/// A task waiting for credit in `h.send`.
-async fn waiting_send(h: &IpPacketSender) -> tokio::task::JoinHandle<Result<(), IpError>> {
+/// Counts the wakes of its waker.
+#[derive(Default)]
+struct Wakes(AtomicUsize);
+
+impl Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Wakes {
+    fn woken(&self) -> bool {
+        self.0.load(Ordering::SeqCst) > 0
+    }
+}
+
+type Sending = Pin<Box<dyn Future<Output = Result<(), IpError>> + Send>>;
+
+/// A send through `h` that was polled and waits for credit, and the wakes of the waker
+/// it waits with.
+fn waiting_send(h: &IpPacketSender) -> (Sending, Arc<Wakes>) {
     let h = h.clone();
-    let job = tokio::spawn(async move { h.send(up()).await });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(!job.is_finished());
-    job
+    let mut f: Sending = Box::pin(async move { h.send(up()).await });
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(wakes.clone());
+    assert!(
+        f.as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    (f, wakes)
+}
+
+/// A waker that polls its send at once, on the waking thread, as some executors do.
+#[derive(Default)]
+struct Inline(Mutex<Option<Sending>>);
+
+impl Wake for Inline {
+    fn wake(self: Arc<Self>) {
+        let mut send = self.0.lock().unwrap();
+        let waker = Waker::from(self.clone());
+        if let Some(f) = send.as_mut() {
+            if f.as_mut().poll(&mut Context::from_waker(&waker)).is_ready() {
+                *send = None;
+            }
+        }
+    }
+}
+
+/// A capsule connection that admits only into an empty send queue.
+async fn tight_masque() -> (Pair, Reqs) {
+    let mut cb = Builder::new();
+    cb.send_capacity(1);
+    masque_over(conns_no_datagrams().await, &cb).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packet_sender_waiters_all_get_credit() {
+    with_timeout(async {
+        let (mut p, mut reqs) = tight_masque().await;
+        let (_c, mut s, h, sent) = full_stream(&mut p, &mut reqs).await;
+        // Three sends wait at once, then each in a task of its own: the one waker the
+        // stream keeps has to reach them all.
+        let jobs: Vec<_> = (0..3).map(|_| tokio::spawn(waiting_send(&h).0)).collect();
+        for n in 0..sent {
+            assert_eq!(next_packet(&mut s).await, tagged(n, 60_000));
+        }
+        for _ in 0..3 {
+            assert_eq!(next_packet(&mut s).await, up());
+        }
+        for j in jobs {
+            j.await.unwrap().unwrap();
+        }
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn packet_sender_closed_by_finish() {
     with_timeout(async {
-        let mut cb = Builder::new();
-        cb.send_capacity(1);
-        let (mut p, mut reqs) = masque_over(conns_no_datagrams().await, &cb).await;
+        let (mut p, mut reqs) = tight_masque().await;
         let (mut c, mut s, h, sent) = full_stream(&mut p, &mut reqs).await;
-        let job = waiting_send(&h).await;
+        let ((f1, w1), (f2, w2)) = (waiting_send(&h), waiting_send(&h));
         c.finish().unwrap();
-        // The waiting task is woken, and nothing goes after the FIN.
-        assert!(matches!(job.await.unwrap(), Err(IpError::Closed)));
+        // The waiting sends are woken, and nothing goes after the FIN.
+        assert!(w1.woken() && w2.woken());
+        assert!(matches!(f1.await, Err(IpError::Closed)));
+        assert!(matches!(f2.await, Err(IpError::Closed)));
         assert!(matches!(h.send(up()).await, Err(IpError::Closed)));
+        assert_eq!(h.max_payload(), None);
         for n in 0..sent {
             assert_eq!(next_packet(&mut s).await, tagged(n, 60_000));
         }
@@ -1047,16 +1114,14 @@ async fn packet_sender_closed_by_finish() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn packet_sender_closed_by_sender_drop() {
     with_timeout(async {
-        let mut cb = Builder::new();
-        cb.send_capacity(1);
-        let (mut p, mut reqs) = masque_over(conns_no_datagrams().await, &cb).await;
+        let (mut p, mut reqs) = tight_masque().await;
         let (c, mut s, h, _) = full_stream(&mut p, &mut reqs).await;
         let (tx, _rx) = c.split();
-        let job = waiting_send(&h).await;
-        // A send in progress, not polled again until the peer saw the abort.
-        let mut held = pin!(h.send(up()));
-        assert!(poll!(held.as_mut()).is_pending());
+        let ((f1, w1), (f2, w2)) = (waiting_send(&h), waiting_send(&h));
         drop(tx);
+        // The request ends although two sends are still in progress.
+        assert!(w1.woken() && w2.woken());
+        assert_eq!(h.max_payload(), None);
         let e = loop {
             match s.recv().await {
                 Ok(Some(_)) => {}
@@ -1065,10 +1130,67 @@ async fn packet_sender_closed_by_sender_drop() {
             }
         };
         assert!(ip_aborted(&e, RC, AbortSource::Peer), "{e:?}");
-        assert!(matches!(job.await.unwrap(), Err(IpError::Closed)));
-        assert!(matches!(held.await, Err(IpError::Closed)));
-        assert_eq!(h.max_payload(), None);
+        assert!(matches!(f1.await, Err(IpError::Closed)));
+        assert!(matches!(f2.await, Err(IpError::Closed)));
+        assert!(matches!(h.send(up()).await, Err(IpError::Closed)));
         assert_eq!(h.check_outgoing(&up()), Ok(()));
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packet_sender_woken_outside_the_lock() {
+    with_timeout(async {
+        let (mut p, mut reqs) = tight_masque().await;
+        let (c, _s, h, _) = full_stream(&mut p, &mut reqs).await;
+        let inline = Arc::new(Inline::default());
+        let (f, _) = waiting_send(&h);
+        *inline.0.lock().unwrap() = Some(f);
+        let waker = Waker::from(inline.clone());
+        let mut cx = Context::from_waker(&waker);
+        let pending = inline
+            .0
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .as_mut()
+            .poll(&mut cx);
+        assert!(pending.is_pending());
+        // The abort wakes the send, which runs inside that wake and needs the stream
+        // sender again. On a thread of its own: a deadlock must not hang the test.
+        let job = std::thread::spawn(move || c.abort(MSG));
+        while !job.is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(inline.0.lock().unwrap().is_none());
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packet_sender_waiters_see_stream_failure() {
+    with_timeout(async {
+        let (mut p, mut reqs) = tight_masque().await;
+        // A local abort.
+        let (c, _s, h, _) = full_stream(&mut p, &mut reqs).await;
+        let ((f1, w1), (f2, w2)) = (waiting_send(&h), waiting_send(&h));
+        c.abort(MSG);
+        assert!(w1.woken() && w2.woken());
+        for f in [f1, f2] {
+            let e = f.await.unwrap_err();
+            assert!(ip_aborted(&e, MSG, AbortSource::Local), "{e:?}");
+        }
+        // The peer's abort.
+        let (_c, s, h, _) = full_stream(&mut p, &mut reqs).await;
+        let ((f1, w1), (f2, w2)) = (waiting_send(&h), waiting_send(&h));
+        s.abort(LOAD);
+        while !(w1.woken() && w2.woken()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for f in [f1, f2] {
+            assert!(matches!(f.await, Err(IpError::Http(_))));
+        }
     })
     .await
 }

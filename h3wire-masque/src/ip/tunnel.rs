@@ -428,7 +428,7 @@ impl IpPacketSender {
         lock(&self.state).check_outgoing(packet)
     }
 
-    /// As [`IpSender::max_payload`]; `None` also once the `IpSender` is gone.
+    /// As [`IpSender::max_payload`]; `None` also once the `IpSender` is finished or gone.
     pub fn max_payload(&self) -> Option<usize> {
         self.tx.upgrade()?.max_payload(MAX_IP_PACKET)
     }
