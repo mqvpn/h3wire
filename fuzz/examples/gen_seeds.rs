@@ -12,9 +12,10 @@ use arbitrary::{Arbitrary, Unstructured};
 use h3wire::FieldRef;
 use h3wire_fuzz::{IDS, Op, WireOp};
 use h3wire_masque::ip::{
-    AssignedAddress, IpPrefix, IpRange, RequestedAddress, encode_address_assign,
+    AssignedAddress, IpPrefix, IpRange, IpTemplate, RequestedAddress, encode_address_assign,
     encode_address_request, encode_routes,
 };
+use http::Uri;
 use std::fmt::Debug;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -713,9 +714,9 @@ fn ip_capsule_seeds() -> Vec<(&'static str, Vec<u8>)> {
 fn ip_template_seeds() -> Vec<(&'static str, Vec<u8>)> {
     let with = |tpl: &str, uri: &str| [tpl.as_bytes(), b"\0", uri.as_bytes()].concat();
     let default = "https://proxy.example/.well-known/masque/ip/{target}/{ipproto}/";
-    let vpn = "https://proxy.example/vpn?t={target}&p={ipproto}";
+    let vpn = "https://proxy.example/vpn/{target}/{ipproto}";
     let p = "/.well-known/masque/ip";
-    vec![
+    let seeds = vec![
         ("default_any", with(default, &format!("{p}/*/*/"))),
         (
             "default_prefix",
@@ -729,9 +730,22 @@ fn ip_template_seeds() -> Vec<(&'static str, Vec<u8>)> {
             "default_host",
             with(default, &format!("{p}/host.example/17/")),
         ),
-        ("vpn_any", with(vpn, "/vpn?t=*&p=*")),
-        ("vpn_prefix", with(vpn, "/vpn?t=198.51.100.7&p=1")),
-    ]
+        ("vpn_any", with(vpn, "/vpn/*/*")),
+        ("vpn_prefix", with(vpn, "/vpn/198.51.100.7/1")),
+    ];
+    // Every seed is meant to match: one that no longer parses or matches would be dead.
+    for (name, bytes) in &seeds {
+        let i = bytes.iter().position(|&b| b == 0).unwrap();
+        let tpl = IpTemplate::parse(std::str::from_utf8(&bytes[..i]).unwrap());
+        let uri = std::str::from_utf8(&bytes[i + 1..])
+            .unwrap()
+            .parse::<Uri>()
+            .unwrap();
+        let scope = tpl.unwrap().match_scope(&uri);
+        println!("ip_template/{name}: parse ok, match {scope:?}");
+        assert!(scope.is_ok(), "ip_template/{name} does not match");
+    }
+    seeds
 }
 
 /// `Input` of `ip_policy`: `arbitrary` 1.4 reads the lists and options from the front and
