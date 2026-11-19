@@ -46,7 +46,7 @@ mod linux {
     use h3wire_async::rt::TokioExecutor;
     use h3wire_async::{BoxError, Builder};
     use h3wire_masque::ip::{
-        self, AssignedAddress, IpEvent, IpPrefix, IpRange, IpSender, IpTemplate, IpTunnel,
+        self, AssignedAddress, IpEvent, IpPacketSender, IpPrefix, IpRange, IpTemplate, IpTunnel,
         MAX_IP_PACKET, RequestedAddress, ScopeTarget,
     };
     use h3wire_masque::server::Reject;
@@ -64,7 +64,6 @@ mod linux {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll};
-    use tokio::sync::Mutex;
     use tokio_tun::Tun;
     use tower_service::Service;
 
@@ -338,8 +337,9 @@ mod linux {
         if let Err(e) = tunnel.advertise(routes).await {
             return eprintln!("tunnel: {e}");
         }
-        let (tx, mut rx) = tunnel.split();
-        let tx = Mutex::new(tx);
+        let (mut tx, mut rx) = tunnel.split();
+        // Packets go through their own handle, so `tx` is free for the control capsules.
+        let packets = tx.packet_sender();
         // `true`: the client finished the tunnel.
         let up = async {
             loop {
@@ -351,7 +351,7 @@ mod linux {
                         }
                     }
                     Ok(Some(IpEvent::AddressRequest(reqs))) => {
-                        if let Err(e) = tx.lock().await.assign(&answer(assign, &reqs)).await {
+                        if let Err(e) = tx.assign(&answer(assign, &reqs)).await {
                             eprintln!("tunnel: {e}");
                             return false;
                         }
@@ -373,7 +373,7 @@ mod linux {
                     Ok(p) => p.len(),
                     Err(e) => return eprintln!("TUN device: {e}"),
                 };
-                if forward(&tx, &buf[..n]).await.is_err() {
+                if forward(&packets, &buf[..n]).await.is_err() {
                     return;
                 }
             }
@@ -383,13 +383,12 @@ mod linux {
             () = down => false,
         };
         if fin {
-            let _ = tx.lock().await.finish();
+            let _ = tx.finish();
         }
     }
 
     /// Send `packet` if the client's rules admit it; only a tunnel failure is an error.
-    async fn forward(tx: &Mutex<IpSender>, packet: &[u8]) -> Result<(), ()> {
-        let mut tx = tx.lock().await;
+    async fn forward(tx: &IpPacketSender, packet: &[u8]) -> Result<(), ()> {
         if tx.check_outgoing(packet).is_err() {
             return Ok(());
         }

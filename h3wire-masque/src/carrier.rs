@@ -12,9 +12,12 @@ use h3wire_async::core::{AbortSource, H3Code, varint};
 use h3wire_async::datagram::{DatagramReceiver, DatagramSender, Datagrams};
 use h3wire_async::upgrade::{Tunnel, TunnelRecv, TunnelSend};
 use h3wire_async::{DatagramError, Error, ErrorKind};
+use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::pin::pin;
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::task::{Context, Poll, Wake, Waker};
 
 /// Progress steps per carrier in one `recv` poll before yielding.
 const MAX_STEPS: usize = 32;
@@ -109,11 +112,7 @@ pub(crate) async fn open(
     };
     let dtx = dtx.filter(|d| settings_ok && d.max_payload().is_some());
     Ok((
-        Tx {
-            tunnel: tx,
-            dgrams: dtx,
-            finished: false,
-        },
+        Tx::new(tx, dtx),
         Rx {
             tunnel: rx,
             dgrams: drx,
@@ -126,20 +125,193 @@ pub(crate) async fn open(
     ))
 }
 
-/// The sending half of a carrier.
+/// Each lock is for one short step: never across an `.await`.
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The sends waiting for stream credit. The stream keeps one waker, so it is given this
+/// set, which wakes them all; each then tries again.
+#[derive(Debug, Default)]
+struct Waiters(Mutex<WaitList>);
+
+#[derive(Debug, Default)]
+struct WaitList {
+    last_id: u64,
+    wakers: BTreeMap<u64, Waker>,
+    /// The stream sender is locked ([`TxShared::with_tunnel`]): a wake waits for the
+    /// unlock.
+    held: bool,
+    /// A wake came while `held`.
+    woken: bool,
+}
+
+impl Wake for Waiters {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref()
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let all = {
+            let mut list = lock(&self.0);
+            if list.held {
+                list.woken = true;
+                return;
+            }
+            std::mem::take(&mut list.wakers)
+        };
+        all.into_values().for_each(Waker::wake);
+    }
+}
+
+/// One pending send's place among the [`Waiters`]; it goes with the send, so cancelled
+/// sends leave nothing behind.
+struct Slot<'a> {
+    waiters: &'a Waiters,
+    id: Option<u64>,
+}
+
+impl Slot<'_> {
+    fn set(&mut self, w: &Waker) {
+        let mut list = lock(&self.waiters.0);
+        let id = *self.id.get_or_insert_with(|| {
+            list.last_id += 1;
+            list.last_id
+        });
+        list.wakers.insert(id, w.clone());
+    }
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            lock(&self.waiters.0).wakers.remove(&id);
+        }
+    }
+}
+
+/// The locked stream sender of [`TxShared::with_tunnel`]. Its drop, also in a panic,
+/// unlocks and then passes on the wake that waited.
+struct Held<'a> {
+    waiters: &'a Arc<Waiters>,
+    tunnel: Option<MutexGuard<'a, Option<TunnelSend>>>,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        let woken = {
+            let mut list = lock(&self.waiters.0);
+            list.held = false;
+            std::mem::take(&mut list.woken)
+        };
+        self.tunnel = None;
+        if woken {
+            self.waiters.wake_by_ref();
+        }
+    }
+}
+
+/// What [`Tx`] and its [`WeakTx`] share; every method takes `&self`, so tasks can send at
+/// once. Each payload or capsule goes out whole, in no promised order.
 #[derive(Debug)]
-pub(crate) struct Tx {
-    tunnel: TunnelSend,
+pub(crate) struct TxShared {
+    /// `None` once the `Tx` is dropped.
+    tunnel: Mutex<Option<TunnelSend>>,
     /// `Some` iff the carrier is datagrams.
     dgrams: Option<DatagramSender>,
-    finished: bool,
+    /// Finished, or the `Tx` dropped. Written in `with_tunnel`.
+    closed: AtomicBool,
+    waiters: Arc<Waiters>,
+}
+
+/// The sending half of a carrier: the one owner of [`TxShared`]. Dropping it ends the
+/// request as dropping the stream's sender does, whatever `WeakTx` remain.
+#[derive(Debug)]
+pub(crate) struct Tx(Arc<TxShared>);
+
+/// Sends on a [`Tx`]'s carrier without keeping the request open.
+#[derive(Clone, Debug)]
+pub(crate) struct WeakTx(Weak<TxShared>);
+
+impl WeakTx {
+    /// `None` once the `Tx` is finished or gone.
+    pub(crate) fn upgrade(&self) -> Option<Arc<TxShared>> {
+        self.0.upgrade().filter(|s| !s.closed.load(Relaxed))
+    }
+}
+
+impl std::ops::Deref for Tx {
+    type Target = TxShared;
+
+    fn deref(&self) -> &TxShared {
+        &self.0
+    }
+}
+
+impl Drop for Tx {
+    fn drop(&mut self) {
+        // Not left to the `Arc`: a `WeakTx` user waiting for credit holds it too.
+        let tunnel = self.with_tunnel(|tunnel| {
+            self.close();
+            tunnel.take()
+        });
+        drop(tunnel);
+    }
 }
 
 impl Tx {
+    pub(crate) fn new(tunnel: TunnelSend, dgrams: Option<DatagramSender>) -> Self {
+        Self(Arc::new(TxShared {
+            tunnel: Mutex::new(Some(tunnel)),
+            dgrams,
+            closed: AtomicBool::new(false),
+            waiters: Arc::default(),
+        }))
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakTx {
+        WeakTx(Arc::downgrade(&self.0))
+    }
+
+    /// Finish the stream after everything sent so far.
+    pub(crate) fn finish(&self) -> Result<(), TxError> {
+        self.with_tunnel(|tunnel| {
+            if let Some(t) = tunnel {
+                t.finish()?;
+            }
+            self.close();
+            Ok(())
+        })
+    }
+}
+
+impl TxShared {
+    /// Run `f` on the locked stream sender. One short step, never across an `.await`. No
+    /// waiting send is woken until the lock is released, whatever `f` calls: a waker may
+    /// poll its task at once, and that task locks here again.
+    // shortcut: wakers that are not ours (the receiver's in `abort`, the driver's) still
+    // run under the lock, which only an executor polling inside `wake` can notice, and
+    // quinn wakes under its own lock too; to lift it, never call h3wire-async locked.
+    fn with_tunnel<R>(&self, f: impl FnOnce(&mut Option<TunnelSend>) -> R) -> R {
+        let mut held = Held {
+            waiters: &self.waiters,
+            tunnel: Some(lock(&self.tunnel)),
+        };
+        lock(&self.waiters.0).held = true;
+        f(held.tunnel.as_mut().expect("locked until the drop"))
+    }
+
+    /// Inside `with_tunnel`: nothing is sent from here on, and the sends waiting for
+    /// credit get `Closed`.
+    fn close(&self) {
+        self.closed.store(true, Relaxed);
+        self.waiters.wake_by_ref();
+    }
+
     /// Send `payload` under context ID 0, as a datagram or one DATAGRAM capsule. No size
     /// check. Cancel-safe: a dropped pending send wrote nothing.
-    pub(crate) async fn send_payload(&mut self, payload: Bytes) -> Result<(), TxError> {
-        if self.finished {
+    pub(crate) async fn send_payload(&self, payload: Bytes) -> Result<(), TxError> {
+        if self.closed.load(Relaxed) {
             return Err(TxError::Closed);
         }
         // Context ID 0, one byte.
@@ -155,26 +327,40 @@ impl Tx {
         self.send_capsule(b.freeze()).await
     }
 
-    /// Write an already framed capsule (type, length, value) as is. One
-    /// `TunnelSend::send` call takes the `Bytes` whole or not at all, so a cancelled send
-    /// never leaves half a capsule on the stream.
-    pub(crate) async fn send_capsule(&mut self, capsule: Bytes) -> Result<(), TxError> {
-        if self.finished {
-            return Err(TxError::Closed);
-        }
-        Ok(self.tunnel.send(capsule).await?)
-    }
-
-    /// Finish the stream after everything sent so far.
-    pub(crate) fn finish(&mut self) -> Result<(), TxError> {
-        self.tunnel.finish()?;
-        self.finished = true;
-        Ok(())
+    /// Write an already framed capsule (type, length, value) as is, waiting for stream
+    /// credit. One `TunnelSend::send` poll takes the `Bytes` whole or not at all, so a
+    /// cancelled send never leaves half a capsule on the stream.
+    pub(crate) async fn send_capsule(&self, capsule: Bytes) -> Result<(), TxError> {
+        let all = Waker::from(self.waiters.clone());
+        let mut slot = Slot {
+            waiters: &self.waiters,
+            id: None,
+        };
+        poll_fn(|cx| {
+            self.with_tunnel(|tunnel| {
+                let tunnel = match tunnel {
+                    Some(t) if !self.closed.load(Relaxed) => t,
+                    _ => return Poll::Ready(Err(TxError::Closed)),
+                };
+                let r = pin!(tunnel.send(capsule.clone())).poll(&mut Context::from_waker(&all));
+                if r.is_pending() {
+                    // Only now, so a send that never waits costs nothing here. A wake
+                    // since the poll is not lost: it waits for the unlock.
+                    slot.set(cx.waker());
+                }
+                r.map_err(TxError::Http)
+            })
+        })
+        .await
     }
 
     /// Abort the whole request (both directions) with `code`; idempotent.
     pub(crate) fn abort(&self, code: H3Code) {
-        self.tunnel.abort(code)
+        self.with_tunnel(|tunnel| {
+            if let Some(t) = tunnel {
+                t.abort(code)
+            }
+        })
     }
 
     /// The largest payload [`send_payload`](Self::send_payload) takes now: the datagram
@@ -458,6 +644,63 @@ mod tests {
         let mut b = BytesMut::new();
         capsule::encode(ty, value, &mut b).unwrap();
         b.freeze()
+    }
+
+    #[test]
+    fn waiters_keep_only_pending_sends() {
+        let w = Arc::new(Waiters::default());
+        let len = || lock(&w.0).wakers.len();
+        let slot = || Slot {
+            waiters: &w,
+            id: None,
+        };
+        let (mut a, mut b) = (slot(), slot());
+        a.set(Waker::noop());
+        a.set(Waker::noop());
+        b.set(Waker::noop());
+        assert_eq!(len(), 2);
+        // A cancelled send leaves nothing behind.
+        drop(b);
+        assert_eq!(len(), 1);
+        // A wake empties the set; a send still pending comes back.
+        w.wake_by_ref();
+        assert_eq!(len(), 0);
+        a.set(Waker::noop());
+        assert_eq!(len(), 1);
+        // While the stream sender is locked, a wake only leaves a mark.
+        lock(&w.0).held = true;
+        w.wake_by_ref();
+        assert_eq!(len(), 1);
+        assert!(lock(&w.0).woken);
+        drop(a);
+        assert_eq!(len(), 0);
+    }
+
+    #[test]
+    fn panic_under_the_lock_keeps_wakes_working() {
+        let tx = TxShared {
+            tunnel: Mutex::new(None),
+            dgrams: None,
+            closed: AtomicBool::new(false),
+            waiters: Arc::default(),
+        };
+        let mut slot = Slot {
+            waiters: &tx.waiters,
+            id: None,
+        };
+        slot.set(Waker::noop());
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tx.with_tunnel(|_| {
+                tx.waiters.wake_by_ref();
+                panic!("under the lock")
+            })
+        }));
+        assert!(caught.is_err());
+        // The wake that waited went out, and the next one does not wait.
+        assert!(lock(&tx.waiters.0).wakers.is_empty());
+        slot.set(Waker::noop());
+        tx.waiters.wake_by_ref();
+        assert!(lock(&tx.waiters.0).wakers.is_empty());
     }
 
     /// Everything `next` yields until it needs more bytes.

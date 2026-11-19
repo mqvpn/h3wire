@@ -128,6 +128,23 @@ async fn ipv6_refusal_below_1280_aborts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_refusal_through_packet_sender_aborts() {
+    with_timeout(async {
+        let (mut p, mut reqs) = masque_over(conns_mtu(1200).await, &Builder::new()).await;
+        let (mut c, mut s) = ip_pair(&mut p, &mut reqs).await;
+        setup6(&mut c, &mut s).await;
+        let h = c.packet_sender();
+        assert_eq!(h.max_payload(), c.max_payload());
+        h.send(v6(1000)).await.unwrap();
+        assert_eq!(next_packet(&mut s).await, v6(1000));
+        assert!(matches!(h.send(v6(1300)).await, Err(IpError::MtuTooSmall)));
+        let e = s.recv().await.unwrap_err();
+        assert!(ip_aborted(&e, DG, AbortSource::Peer), "{e:?}");
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ipv6_refusal_at_or_above_1280_is_too_large() {
     with_timeout(async {
         let (mut p, mut reqs) = masque_over(conns_mtu(1400).await, &Builder::new()).await;
